@@ -14,6 +14,7 @@ type Config struct {
 	DBPath           string
 	LogLevel         string
 	HTTPListenAddr   string
+	DNSListenAddr    string
 	SyncBaseURL      string
 	NodeToken        string
 	ShutdownTimeout  time.Duration
@@ -29,6 +30,7 @@ func LoadConfigFromEnv() (Config, error) {
 		DBPath:           getenv("SS_ROUTER_DB_PATH", "./data/router.db"),
 		LogLevel:         getenv("SS_ROUTER_LOG_LEVEL", "info"),
 		HTTPListenAddr:   getenv("SS_ROUTER_HTTP_ADDR", "127.0.0.1:8099"),
+		DNSListenAddr:    getenv("SS_ROUTER_DNS_ADDR", "127.0.0.1:5353"),
 		SyncBaseURL:      getenv("SS_ROUTER_SYNC_BASE_URL", "http://127.0.0.1:54321"),
 		NodeToken:        getenv("SS_ROUTER_NODE_TOKEN", ""),
 		ShutdownTimeout:  time.Duration(getenvInt("SS_ROUTER_SHUTDOWN_TIMEOUT_SEC", 10)) * time.Second,

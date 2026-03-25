@@ -11,10 +11,11 @@ type Bundle struct {
 }
 
 type ChildEffectiveState struct {
-	ChildID         string   `json:"child_id"`
-	DeviceMAC       string   `json:"device_mac,omitempty"` // MAC of the enrolled device for presence cross-ref
-	Mode            string   `json:"mode"`
-	LockEnabled     bool     `json:"lock_enabled"`
-	DNSProfileID    string   `json:"dns_profile_id"`
-	AllowedServices []string `json:"allowed_services,omitempty"`
+	ChildID            string   `json:"child_id"`
+	DeviceMAC          string   `json:"device_mac,omitempty"`
+	WireGuardPublicKey string   `json:"wireguard_public_key,omitempty"`
+	Mode               string   `json:"mode"`
+	LockEnabled        bool     `json:"lock_enabled"`
+	DNSProfileID       string   `json:"dns_profile_id"`
+	AllowedServices    []string `json:"allowed_services,omitempty"`
 }

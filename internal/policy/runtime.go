@@ -17,9 +17,21 @@ type Runtime struct {
 	logger Logger
 	mu     sync.RWMutex
 	active *contract.Bundle
+
+	// onSwap is called after every successful bundle swap.
+	// Used by the firewall enforcer to chain rule resyncs.
+	// Registered via SetOnSwap — nil is safe (no-op).
+	onSwap func(ctx context.Context)
 }
 
 func NewRuntime(db *sql.DB, logger Logger) *Runtime { return &Runtime{db: db, logger: logger} }
+
+// SetOnSwap registers a callback that fires after every SwapBundle.
+func (r *Runtime) SetOnSwap(fn func(ctx context.Context)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onSwap = fn
+}
 func (r *Runtime) Name() string                     { return "policy-runtime" }
 func (r *Runtime) Stop(ctx context.Context) error   { return nil }
 func (r *Runtime) Health(ctx context.Context) error { return nil }
@@ -52,9 +64,33 @@ func (r *Runtime) SwapBundle(ctx context.Context, b *contract.Bundle) error {
 	if err != nil { return fmt.Errorf("upsert bundle: %w", err) }
 	r.mu.Lock()
 	r.active = b
+	cb := r.onSwap
 	r.mu.Unlock()
 	r.logger.Printf("[policy] swapped bundle version=%s", b.Version)
+	// Fire firewall sync callback outside the lock — Sync() will re-acquire its own lock
+	if cb != nil {
+		cb(ctx)
+	}
 	return nil
+}
+
+// DNSProfileForMAC returns the dns_profile_id for the child whose enrolled
+// device MAC matches. Returns "default" when no match is found or no bundle loaded.
+func (r *Runtime) DNSProfileForMAC(mac string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.active == nil {
+		return "default"
+	}
+	for _, child := range r.active.Children {
+		if child.DeviceMAC == mac {
+			if child.DNSProfileID != "" {
+				return child.DNSProfileID
+			}
+			return "default"
+		}
+	}
+	return "default"
 }
 
 // EnrolledMACs returns a set of device MACs present in the active policy bundle.
