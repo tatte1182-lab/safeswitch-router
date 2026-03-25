@@ -1,0 +1,9 @@
+Package: safeswitch-node
+Version: 1.0.0
+Architecture: aarch64_cortex-a53
+Maintainer: SafeSwitch <support@getsafeswitch.app>
+Depends: wireguard-tools, iptables, dnsmasq
+Description: SafeSwitch router node agent
+ Turns your OpenWrt router into a SafeSwitch Home Node.
+Section: net
+Priority: optional
