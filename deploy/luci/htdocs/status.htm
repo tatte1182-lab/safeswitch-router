@@ -1,0 +1,43 @@
+<%+header%>
+<style>
+.ss-card{background:#1a1a2e;border:1px solid #2a2a4e;border-radius:10px;padding:18px 22px;margin-bottom:16px;color:#e8edf8}
+.ss-card h3{margin:0 0 14px;font-size:14px;text-transform:uppercase;letter-spacing:.1em;color:#97a6c3}
+.ss-stat{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2a2a4e;font-size:13px}
+.ss-stat:last-child{border-bottom:none}
+.ss-stat .label{color:#97a6c3}
+.ss-stat .value{font-weight:bold;font-family:monospace}
+.ss-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.ss-online{color:#00e5a0}.ss-offline{color:#ff4757}.ss-pending{color:#ffb800}
+</style>
+<h2><%:SafeSwitch Node Status%></h2>
+<div id="ss-root"><p style="color:#97a6c3"><%:Loading...%></p></div>
+<script>
+var API="http://127.0.0.1:8099";
+function stat(l,v){return'<div class="ss-stat"><span class="label">'+l+'</span><span class="value">'+v+'</span></div>'}
+function fetchJSON(p,cb){var x=new XMLHttpRequest();x.open("GET",API+p,true);x.timeout=3000;x.onreadystatechange=function(){if(x.readyState===4){try{cb(null,JSON.parse(x.responseText))}catch(e){cb(e,null)}}};x.onerror=function(){cb(new Error("network"),null)};x.send()}
+function render(node,tunnel,enroll,devices){
+  var h='<div class="ss-grid">';
+  h+='<div class="ss-card"><h3>Node</h3>';
+  if(node)h+=stat("Node ID",(node.node_id||"-").substring(0,16)+"...");
+  if(enroll)h+=stat("Status",enroll.enrolled?'<span class="ss-online">Enrolled</span>':'<span class="ss-pending">Not enrolled</span>');
+  h+='</div>';
+  h+='<div class="ss-card"><h3>WireGuard</h3>';
+  if(tunnel){h+=stat("Peers",tunnel.peer_count||0);h+=stat("Port",tunnel.listen_port||51820);}
+  h+='</div>';
+  h+='<div class="ss-card"><h3>Devices</h3>';
+  if(devices){h+=stat("Total",devices.count||0);h+=stat("Enrolled",(devices.devices||[]).filter(function(d){return d.enrolled}).length);}
+  h+='</div></div>';
+  h+='<p style="color:#54637f;font-size:11px">Updated: '+new Date().toLocaleTimeString()+'</p>';
+  document.getElementById("ss-root").innerHTML=h;
+}
+function refresh(){
+  var r={};var p=3;
+  function done(k,d){r[k]=d;if(--p===0)render(r.node,r.tunnel,r.enroll,r.devices)}
+  fetchJSON("/v1/node",function(e,d){done("node",d)});
+  fetchJSON("/v1/tunnel",function(e,d){done("tunnel",d)});
+  fetchJSON("/v1/enrollment/state",function(e,d){done("enroll",d)});
+  fetchJSON("/v1/devices",function(e,d){r.devices=d;if(--p===0)render(r.node,r.tunnel,r.enroll,r.devices)});
+}
+refresh();setInterval(refresh,10000);
+</script>
+<%+footer%>
