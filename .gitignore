@@ -1,0 +1,7 @@
+﻿ss-router
+ss-router-linux
+*.exe
+*.db
+*.db-shm
+*.db-wal
+ss-data/
