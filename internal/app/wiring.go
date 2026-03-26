@@ -44,32 +44,54 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 
 	devMode := cfg.Environment != "prod"
 
-	journal       := events.NewJournal(db, logger)
-	policyRuntime := policy.NewRuntime(db, logger)
-	healthSvc     := health.NewService(db, logger, cfg.HeartbeatEvery)
+	journal        := events.NewJournal(db, logger)
+	policyRuntime  := policy.NewRuntime(db, logger)
+	healthSvc      := health.NewService(db, logger, cfg.HeartbeatEvery)
 	presenceEngine := presence.NewEngine(db, logger, journal, policyRuntime, 30*time.Second)
 
-	// Route profile store — authoritative per-device route intent.
 	routeProfileStore := commands.NewDBRouteProfileStore(db)
 
-	// DNS engine
 	blocklist := dns.NewBlocklist()
 	resolver  := dns.NewResolver(blocklist, policyRuntime, presenceEngine, logger)
 	dnsServer := dns.NewServer(db, logger, resolver, blocklist, cfg.DNSListenAddr)
 
-	// Tunnel manager
 	tunnelMgr := tunnel.NewManager(db, logger, journal, policyRuntime, devMode)
 
-	// Firewall enforcer — reads route profiles + policy bundle to build rules.
-	// Chains onto every policy bundle swap.
-	enforcer := firewall.NewEnforcer(db, logger, policyRuntime, tunnelMgr, routeProfileStore, devMode)
+	enforcer := firewall.NewEnforcer(db, routeProfileStore, devMode, logger)
 	policyRuntime.SetOnSwap(func(ctx context.Context) {
-		if err := enforcer.Sync(ctx); err != nil {
+		if err := enforcer.SyncFromBundle(ctx); err != nil {
 			logger.Printf("[wiring] firewall sync after bundle swap: %v", err)
+		}
+		if err := tunnelMgr.TriggerSync(ctx); err != nil {
+			logger.Printf("[wiring] tunnel sync after bundle swap: %v", err)
 		}
 	})
 
-	// Command executor — all engines live.
+	enforcer.SetBundleProvider(func() []firewall.Child {
+		bundle, err := policyRuntime.ActiveBundle(context.Background())
+		if err != nil || bundle == nil {
+			return nil
+		}
+		children := make([]firewall.Child, 0, len(bundle.Children))
+		for _, c := range bundle.Children {
+			paused := c.LockEnabled || c.Mode == "paused"
+			routeMode := "split_tunnel"
+			if c.Mode == "full_tunnel" {
+				routeMode = "full_tunnel"
+			}
+			children = append(children, firewall.Child{
+				ChildID:            c.ChildID,
+				DeviceMAC:          c.DeviceMAC,
+				WireguardPublicKey: c.WireGuardPublicKey,
+				WireguardIP:        c.WireguardIP,
+				DisplayName:        c.DNSProfileID,
+				Paused:             paused,
+				RouteMode:          routeMode,
+			})
+		}
+		return children
+	})
+
 	executor := commands.NewExecutor(db, logger)
 	commands.RegisterHandlers(executor, policyRuntime, dnsServer, tunnelMgr, enforcer, routeProfileStore, logger)
 
