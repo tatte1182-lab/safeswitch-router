@@ -36,6 +36,18 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 			client_applied_at       TEXT,
 			updated_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);`,
+			`CREATE TABLE IF NOT EXISTS dns_blocklist (
+			domain   TEXT PRIMARY KEY,
+			category TEXT NOT NULL DEFAULT 'malware',
+			source   TEXT NOT NULL DEFAULT 'safeswitch',
+			added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
+			`CREATE TABLE IF NOT EXISTS dns_blocklist (
+			domain   TEXT PRIMARY KEY,
+			category TEXT NOT NULL DEFAULT 'malware',
+			source   TEXT NOT NULL DEFAULT 'safeswitch',
+			added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
 	}
 	for i, stmt := range stmts {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {

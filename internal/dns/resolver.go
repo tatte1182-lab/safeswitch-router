@@ -33,7 +33,7 @@ blocklist: bl,
 policy:    policy,
 presence:  presence,
 logger:    logger,
-upstreams: []string{"1.1.1.1:53", "9.9.9.9:53", "8.8.8.8:53"},
+upstreams: []string{"185.228.168.168:53", "185.228.169.168:53", "1.1.1.3:53"},
 }
 }
 
