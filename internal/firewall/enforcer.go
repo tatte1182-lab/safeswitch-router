@@ -26,40 +26,54 @@ type TunnelIPReader interface {
 	TunnelIPForMAC(ctx context.Context, mac string) string
 }
 
+// RouteProfileReader returns the stored route profile for a device MAC.
+// Returns "split_tunnel" when no profile is set (safe default).
+type RouteProfileReader interface {
+	RouteProfileForMAC(ctx context.Context, mac string) string
+}
+
 // Enforcer manages the SAFESWITCH iptables chain.
+//
+// Enforcement model: A-first (node authority), B-assisted (client cooperation).
 //
 // On every Sync() call it:
 //  1. Flushes the SAFESWITCH chain
 //  2. Re-reads the active policy bundle
-//  3. Rebuilds rules for every child device based on their effective state
+//  3. For each child device, resolves effective state from:
+//     - pause_overrides (highest priority — immediate command)
+//     - device_route_profiles (guardian-set route intent)
+//     - policy bundle lock_enabled / mode (scheduled / agreement state)
+//  4. Rebuilds iptables rules accordingly
 //
-// Individual pause/unpause commands call Sync() after updating the local
-// pause_state table so the chain reflects the new state immediately.
+// This means full_tunnel enforcement fires at the node even if the child
+// app has not yet reconfigured its WireGuard AllowedIPs client-side.
 type Enforcer struct {
-	db      *sql.DB
-	logger  Logger
-	policy  PolicyReader
-	tunnel  TunnelIPReader
-	devMode bool // true = log rules but skip iptables calls
+	db           *sql.DB
+	logger       Logger
+	policy       PolicyReader
+	tunnel       TunnelIPReader
+	routeProfile RouteProfileReader
+	devMode      bool
 
-	mu sync.Mutex // serialise all iptables operations
+	mu sync.Mutex
 }
 
-// NewEnforcer constructs the Enforcer. devMode=true logs rules without
-// executing them — safe to run without root or iptables installed.
+// NewEnforcer constructs the Enforcer.
 func NewEnforcer(
 	db *sql.DB,
 	logger Logger,
 	policy PolicyReader,
 	tunnel TunnelIPReader,
+	routeProfile RouteProfileReader,
 	devMode bool,
 ) *Enforcer {
 	return &Enforcer{
-		db:      db,
-		logger:  logger,
-		policy:  policy,
-		tunnel:  tunnel,
-		devMode: devMode,
+		db:           db,
+		logger:       logger,
+		policy:       policy,
+		tunnel:       tunnel,
+		routeProfile: routeProfile,
+		devMode:      devMode,
 	}
 }
 
@@ -70,7 +84,6 @@ func (e *Enforcer) Start(ctx context.Context) error {
 		return err
 	}
 	if err := e.ensureChain(); err != nil {
-		// Non-fatal — iptables may not be available on first boot
 		e.logger.Printf("[firewall] chain setup warning: %v", err)
 	}
 	if err := e.Sync(ctx); err != nil {
@@ -80,25 +93,23 @@ func (e *Enforcer) Start(ctx context.Context) error {
 	return nil
 }
 
-func (e *Enforcer) Stop(ctx context.Context) error { return nil }
+func (e *Enforcer) Stop(ctx context.Context) error  { return nil }
 func (e *Enforcer) Health(ctx context.Context) error { return nil }
 
-// Sync rebuilds the entire SAFESWITCH chain from the active policy bundle.
-// Called on every bundle swap and after individual pause/unpause commands.
-// Idempotent — flush then reapply.
+// Sync rebuilds the entire SAFESWITCH chain from current state.
+// Idempotent — flush then reapply. Called on bundle swap, pause/unpause,
+// and set_route_profile commands.
 func (e *Enforcer) Sync(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Flush existing rules
 	if err := e.ipt(ChainFlushArgs()...); err != nil {
 		e.logger.Printf("[firewall] flush warning: %v", err)
 	}
 
 	bundle, err := e.policy.ActiveBundle(ctx)
 	if err != nil {
-		// No bundle yet — nothing to enforce
-		return nil
+		return nil // no bundle yet
 	}
 
 	applied := 0
@@ -107,7 +118,6 @@ func (e *Enforcer) Sync(ctx context.Context) error {
 			continue
 		}
 
-		// Get the tunnel IP for this device
 		ip := e.tunnel.TunnelIPForMAC(ctx, child.DeviceMAC)
 		if ip == "" {
 			e.logger.Printf("[firewall] no tunnel IP for mac=%s child=%s — skipping",
@@ -115,7 +125,6 @@ func (e *Enforcer) Sync(ctx context.Context) error {
 			continue
 		}
 
-		// Determine state: check pause_overrides first, then bundle lock state
 		state := e.resolveState(ctx, child)
 		rs := BuildRules(ip, state)
 
@@ -134,7 +143,6 @@ func (e *Enforcer) Sync(ctx context.Context) error {
 }
 
 // PauseDevice immediately pauses a device by MAC address.
-// Records the pause in pause_overrides then calls Sync to apply the DROP rule.
 func (e *Enforcer) PauseDevice(ctx context.Context, mac string) error {
 	if err := e.setPauseOverride(ctx, mac, true); err != nil {
 		return err
@@ -152,10 +160,15 @@ func (e *Enforcer) UnpauseDevice(ctx context.Context, mac string) error {
 	return e.Sync(ctx)
 }
 
-// resolveState determines the enforcement state for a child.
-// pause_overrides takes precedence over the bundle's lock_enabled flag.
+// resolveState determines effective enforcement state for a child device.
+//
+// Priority order (highest to lowest):
+//  1. pause_overrides — immediate command from guardian (always wins)
+//  2. device_route_profiles — guardian-set route profile (full_tunnel, service_only)
+//  3. policy bundle lock_enabled — scheduled or agreement lock
+//  4. policy bundle mode — default routing mode
 func (e *Enforcer) resolveState(ctx context.Context, child policybundle.ChildEffectiveState) string {
-	// Check local pause override first
+	// 1. Check immediate pause override
 	var paused int
 	_ = e.db.QueryRowContext(ctx,
 		`SELECT paused FROM pause_overrides WHERE mac = ?`, child.DeviceMAC,
@@ -164,12 +177,27 @@ func (e *Enforcer) resolveState(ctx context.Context, child policybundle.ChildEff
 		return StatePaused
 	}
 
-	// Then check bundle lock
+	// 2. Check guardian-set route profile (Option A enforcement)
+	if e.routeProfile != nil {
+		profile := e.routeProfile.RouteProfileForMAC(ctx, child.DeviceMAC)
+		switch profile {
+		case "full_tunnel":
+			// Full tunnel — device must route all traffic through the node.
+			// Drop any traffic that isn't arriving via wg0 (enforced at FORWARD level).
+			// The child app is also asked cooperatively to set AllowedIPs=0.0.0.0/0.
+			return StateFullTunnel
+		case "service_only":
+			return StateServiceOnly
+		// split_tunnel falls through to policy bundle
+		}
+	}
+
+	// 3. Policy bundle lock
 	if child.LockEnabled {
 		return StatePaused
 	}
 
-	// Route profile from mode
+	// 4. Policy bundle mode
 	switch child.Mode {
 	case "service_only":
 		return StateServiceOnly
@@ -178,7 +206,6 @@ func (e *Enforcer) resolveState(ctx context.Context, child policybundle.ChildEff
 	}
 }
 
-// setPauseOverride writes or clears a pause override for a MAC.
 func (e *Enforcer) setPauseOverride(ctx context.Context, mac string, paused bool) error {
 	p := 0
 	if paused {
@@ -195,16 +222,13 @@ func (e *Enforcer) setPauseOverride(ctx context.Context, mac string, paused bool
 	return nil
 }
 
-// ensureChain creates the SAFESWITCH chain and installs the FORWARD jump.
 func (e *Enforcer) ensureChain() error {
 	for _, args := range ChainEnsureArgs() {
-		// -N returns exit code 1 if chain already exists — that's fine
 		_ = e.ipt(args...)
 	}
 	return nil
 }
 
-// ipt executes one iptables command. In devMode it logs instead of executing.
 func (e *Enforcer) ipt(args ...string) error {
 	if e.devMode {
 		e.logger.Printf("[firewall:dry-run] iptables %s", strings.Join(args, " "))
@@ -219,7 +243,6 @@ func (e *Enforcer) ipt(args ...string) error {
 	return nil
 }
 
-// ensureSchema creates the pause_overrides table.
 func (e *Enforcer) ensureSchema(ctx context.Context) error {
 	_, err := e.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS pause_overrides (

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"time"
@@ -29,25 +30,28 @@ type TunnelManager interface {
 type FirewallEnforcer interface {
 	PauseDevice(ctx context.Context, mac string) error
 	UnpauseDevice(ctx context.Context, mac string) error
+	Sync(ctx context.Context) error
+}
+
+// RouteProfileStore persists route profile intent per device.
+type RouteProfileStore interface {
+	SetRouteProfile(ctx context.Context, mac, profile, source string) error
 }
 
 // RegisterHandlers wires all built-in command handlers into the executor.
-// Any dependency may be nil — its commands become logged no-ops until wired.
-func RegisterHandlers(e *Executor, policy PolicySwapper, dnsServer DNSReloader, tunnelMgr TunnelManager, fw FirewallEnforcer, logger Logger) {
-	e.Register("ping",               makePingHandler(logger))
-	e.Register("pause_device",       makePauseDeviceHandler(fw, logger))
-	e.Register("unpause_device",     makeUnpauseDeviceHandler(fw, logger))
-	e.Register("update_policy",      makeUpdatePolicyHandler(policy, logger))
-	e.Register("set_route_profile",  makeSetRouteProfileHandler(logger))
+func RegisterHandlers(e *Executor, policy PolicySwapper, dnsServer DNSReloader, tunnelMgr TunnelManager, fw FirewallEnforcer, rps RouteProfileStore, logger Logger) {
+	e.Register("ping", makePingHandler(logger))
+	e.Register("pause_device", makePauseDeviceHandler(fw, logger))
+	e.Register("unpause_device", makeUnpauseDeviceHandler(fw, logger))
+	e.Register("update_policy", makeUpdatePolicyHandler(policy, logger))
+	e.Register("set_route_profile", makeSetRouteProfileHandler(fw, rps, logger))
 	e.Register("reload_dns_profile", makeReloadDNSProfileHandler(dnsServer, logger))
-	e.Register("add_peer",           makeAddPeerHandler(tunnelMgr, logger))
-	e.Register("remove_peer",        makeRemovePeerHandler(tunnelMgr, logger))
-	e.Register("restart",            makeRestartHandler(logger))
+	e.Register("add_peer", makeAddPeerHandler(tunnelMgr, logger))
+	e.Register("remove_peer", makeRemovePeerHandler(tunnelMgr, logger))
+	e.Register("restart", makeRestartHandler(logger))
 }
 
 // ── ping ─────────────────────────────────────────────────────────────────────
-// Simplest possible command. Used by Supabase to verify the command pipeline
-// is live end-to-end without side effects.
 
 func makePingHandler(logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -60,9 +64,6 @@ func makePingHandler(logger Logger) Handler {
 }
 
 // ── pause_device ──────────────────────────────────────────────────────────────
-// Payload: {"device_mac": "aa:bb:cc:dd:ee:ff"}
-// Phase R2: writes the pause state to policy cache. Phase R5 (firewall enforcer)
-// will add the actual iptables DROP rule on top of this.
 
 func makePauseDeviceHandler(fw FirewallEnforcer, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -101,18 +102,13 @@ func makeUnpauseDeviceHandler(fw FirewallEnforcer, logger Logger) Handler {
 }
 
 // ── update_policy ─────────────────────────────────────────────────────────────
-// Payload: full policy bundle JSON matching policybundle.Bundle schema.
-// Swaps the active bundle atomically — triggers policy runtime to recompute
-// child effective states. R5 will chain firewall sync onto this.
 
 func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
-		// Extract required fields from the raw payload map
 		version, err := requireString(payload, "version")
 		if err != nil {
 			return nil, err
 		}
-
 		issuedAtStr, err := requireString(payload, "issued_at")
 		if err != nil {
 			return nil, err
@@ -121,7 +117,6 @@ func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 		if err != nil {
 			return nil, fmt.Errorf("invalid issued_at: %w", err)
 		}
-
 		expiresAtStr, err := requireString(payload, "expires_at")
 		if err != nil {
 			return nil, err
@@ -130,10 +125,8 @@ func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 		if err != nil {
 			return nil, fmt.Errorf("invalid expires_at: %w", err)
 		}
-
 		signature, _ := payload["signature"].(string)
 
-		// Parse children array
 		var children []policybundle.ChildEffectiveState
 		if raw, ok := payload["children"]; ok {
 			if arr, ok := raw.([]any); ok {
@@ -163,53 +156,83 @@ func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 		if err := policy.SwapBundle(ctx, bundle); err != nil {
 			return nil, fmt.Errorf("swap bundle: %w", err)
 		}
-
-		logger.Printf("[cmd:update_policy] bundle swapped version=%s children=%d",
-			version, len(children))
-
-		return map[string]any{
-			"version":  version,
-			"children": len(children),
-		}, nil
+		logger.Printf("[cmd:update_policy] bundle swapped version=%s children=%d", version, len(children))
+		return map[string]any{"version": version, "children": len(children)}, nil
 	}
 }
 
 // ── set_route_profile ─────────────────────────────────────────────────────────
-// Payload: {"profile": "full_tunnel" | "split_tunnel" | "service_only", "device_mac": "..."}
-// R2: logs and stores intent. R4 (tunnel manager) will apply the actual
-// ip rule / ip route changes when it comes online.
+// Payload: {"profile": "full_tunnel|split_tunnel|service_only", "device_mac": "aa:bb:cc:dd:ee:ff"}
+//
+// Enforcement model: A-first, B-assisted.
+//
+//  A (mandatory): persists intent to device_route_profiles, triggers firewall
+//     resync so egress rules are updated immediately regardless of client state.
+//
+//  B (best-effort): records client_applied=false so the command dispatcher can
+//     push a cooperative update to the child app on next poll. The child app
+//     reconfigures its WireGuard AllowedIPs for cleaner routing, but this is
+//     not relied upon for security.
 
-func makeSetRouteProfileHandler(logger Logger) Handler {
+func makeSetRouteProfileHandler(fw FirewallEnforcer, rps RouteProfileStore, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
 		profile, err := requireString(payload, "profile")
 		if err != nil {
 			return nil, err
 		}
-
 		validProfiles := map[string]bool{
-			"full_tunnel":   true,
-			"split_tunnel":  true,
-			"service_only":  true,
+			"full_tunnel":  true,
+			"split_tunnel": true,
+			"service_only": true,
 		}
 		if !validProfiles[profile] {
 			return nil, fmt.Errorf("unknown profile %q: must be full_tunnel, split_tunnel, or service_only", profile)
 		}
 
-		mac := stringVal(payload, "device_mac") // optional — empty means all devices
-		logger.Printf("[cmd:set_route_profile] profile=%s mac=%q", profile, mac)
+		mac, err := requireString(payload, "device_mac")
+		if err != nil {
+			return nil, err
+		}
+		source := stringVal(payload, "source")
+		if source == "" {
+			source = "guardian"
+		}
 
-		// R4 hook: tunnel manager will intercept here and apply ip rule changes.
+		// Option A — persist intent and enforce immediately at the node.
+		enforced := false
+		if rps != nil {
+			if err := rps.SetRouteProfile(ctx, mac, profile, source); err != nil {
+				logger.Printf("[cmd:set_route_profile] store failed mac=%s: %v", mac, err)
+			} else {
+				logger.Printf("[cmd:set_route_profile] intent stored mac=%s profile=%s source=%s", mac, profile, source)
+				// Trigger immediate firewall resync so egress rules reflect new profile.
+				if fw != nil {
+					if err := fw.Sync(ctx); err != nil {
+						logger.Printf("[cmd:set_route_profile] firewall sync warning: %v", err)
+					} else {
+						enforced = true
+					}
+				}
+			}
+		}
+
+		// Option B — mark client_applied=false so dispatcher can push cooperative
+		// update to child app. The dispatcher will send a set_route_profile command
+		// to the device, which updates its WireGuard AllowedIPs client-side.
+		// This is best-effort only — enforcement does not depend on it.
+		logger.Printf("[cmd:set_route_profile] applied mac=%s profile=%s enforced=%v client_sync=pending", mac, profile, enforced)
+
 		return map[string]any{
-			"profile": profile,
-			"mac":     mac,
-			"applied": false, // true once R4 tunnel manager is wired
+			"mac":           mac,
+			"profile":       profile,
+			"source":        source,
+			"enforced":      enforced,
+			"client_synced": false, // updated to true when child app acks cooperative update
 		}, nil
 	}
 }
 
 // ── reload_dns_profile ────────────────────────────────────────────────────────
-// Payload: {} — no parameters needed; re-reads dns_blocklist from DB.
-// Sent by Supabase after pushing a new threat feed to the router's DB.
 
 func makeReloadDNSProfileHandler(dns DNSReloader, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -226,8 +249,6 @@ func makeReloadDNSProfileHandler(dns DNSReloader, logger Logger) Handler {
 }
 
 // ── add_peer ──────────────────────────────────────────────────────────────────
-// Payload: {"public_key": "<base64>", "device_mac": "aa:bb:cc:dd:ee:ff", "comment": "optional"}
-// Adds a WireGuard peer, allocates a tunnel IP, and resyncs wg0.conf.
 
 func makeAddPeerHandler(mgr TunnelManager, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -238,14 +259,13 @@ func makeAddPeerHandler(mgr TunnelManager, logger Logger) Handler {
 		if err != nil {
 			return nil, err
 		}
-		mac     := stringVal(payload, "device_mac")
+		mac := stringVal(payload, "device_mac")
 		comment := stringVal(payload, "comment")
 
 		allowedIP, err := mgr.AddPeer(ctx, pubKey, mac, comment)
 		if err != nil {
 			return nil, fmt.Errorf("add_peer: %w", err)
 		}
-
 		logger.Printf("[cmd:add_peer] key=%s ip=%s mac=%s", pubKey[:8]+"...", allowedIP, mac)
 		return map[string]any{
 			"public_key": pubKey,
@@ -256,8 +276,6 @@ func makeAddPeerHandler(mgr TunnelManager, logger Logger) Handler {
 }
 
 // ── remove_peer ───────────────────────────────────────────────────────────────
-// Payload: {"public_key": "<base64>"}
-// Removes a WireGuard peer and resyncs wg0.conf.
 
 func makeRemovePeerHandler(mgr TunnelManager, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -268,28 +286,19 @@ func makeRemovePeerHandler(mgr TunnelManager, logger Logger) Handler {
 		if err != nil {
 			return nil, err
 		}
-
 		if err := mgr.RemovePeer(ctx, pubKey); err != nil {
 			return nil, fmt.Errorf("remove_peer: %w", err)
 		}
-
 		logger.Printf("[cmd:remove_peer] key=%s", pubKey[:8]+"...")
-		return map[string]any{
-			"public_key": pubKey,
-			"removed":    true,
-		}, nil
+		return map[string]any{"public_key": pubKey, "removed": true}, nil
 	}
 }
 
 // ── restart ───────────────────────────────────────────────────────────────────
-// Payload: {} (no parameters needed)
-// Exits cleanly — procd/systemd restarts the binary automatically.
-// Used for OTA updates (R6) and remote recovery.
 
 func makeRestartHandler(logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
 		logger.Printf("[cmd:restart] restarting process")
-		// Give the executor time to write the done status before we exit
 		go func() {
 			time.Sleep(500 * time.Millisecond)
 			os.Exit(0)
@@ -331,4 +340,38 @@ func boolVal(m map[string]any, key string) bool {
 		}
 	}
 	return false
+}
+
+// DB-backed RouteProfileStore — used by the firewall enforcer and wiring.
+type DBRouteProfileStore struct {
+	db *sql.DB
+}
+
+func NewDBRouteProfileStore(db *sql.DB) *DBRouteProfileStore {
+	return &DBRouteProfileStore{db: db}
+}
+
+func (s *DBRouteProfileStore) SetRouteProfile(ctx context.Context, mac, profile, source string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO device_route_profiles (mac, route_profile, route_profile_source, client_applied, updated_at)
+		VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP)
+		ON CONFLICT(mac) DO UPDATE SET
+			route_profile        = excluded.route_profile,
+			route_profile_source = excluded.route_profile_source,
+			route_profile_version = route_profile_version + 1,
+			client_applied       = 0,
+			updated_at           = CURRENT_TIMESTAMP
+	`, mac, profile, source)
+	return err
+}
+
+func (s *DBRouteProfileStore) RouteProfileForMAC(ctx context.Context, mac string) string {
+	var profile string
+	_ = s.db.QueryRowContext(ctx,
+		`SELECT route_profile FROM device_route_profiles WHERE mac = ?`, mac,
+	).Scan(&profile)
+	if profile == "" {
+		return "split_tunnel" // safe default
+	}
+	return profile
 }

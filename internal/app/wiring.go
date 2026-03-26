@@ -44,10 +44,13 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 
 	devMode := cfg.Environment != "prod"
 
-	journal        := events.NewJournal(db, logger)
-	policyRuntime  := policy.NewRuntime(db, logger)
-	healthSvc      := health.NewService(db, logger, cfg.HeartbeatEvery)
+	journal       := events.NewJournal(db, logger)
+	policyRuntime := policy.NewRuntime(db, logger)
+	healthSvc     := health.NewService(db, logger, cfg.HeartbeatEvery)
 	presenceEngine := presence.NewEngine(db, logger, journal, policyRuntime, 30*time.Second)
+
+	// Route profile store — authoritative per-device route intent.
+	routeProfileStore := commands.NewDBRouteProfileStore(db)
 
 	// DNS engine
 	blocklist := dns.NewBlocklist()
@@ -57,17 +60,18 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	// Tunnel manager
 	tunnelMgr := tunnel.NewManager(db, logger, journal, policyRuntime, devMode)
 
-	// Firewall enforcer — chains onto every policy bundle swap
-	enforcer := firewall.NewEnforcer(db, logger, policyRuntime, tunnelMgr, devMode)
+	// Firewall enforcer — reads route profiles + policy bundle to build rules.
+	// Chains onto every policy bundle swap.
+	enforcer := firewall.NewEnforcer(db, logger, policyRuntime, tunnelMgr, routeProfileStore, devMode)
 	policyRuntime.SetOnSwap(func(ctx context.Context) {
 		if err := enforcer.Sync(ctx); err != nil {
 			logger.Printf("[wiring] firewall sync after bundle swap: %v", err)
 		}
 	})
 
-	// Command executor — all engines live
+	// Command executor — all engines live.
 	executor := commands.NewExecutor(db, logger)
-	commands.RegisterHandlers(executor, policyRuntime, dnsServer, tunnelMgr, enforcer, logger)
+	commands.RegisterHandlers(executor, policyRuntime, dnsServer, tunnelMgr, enforcer, routeProfileStore, logger)
 
 	controlSyncSvc := controlsync.NewService(
 		db, logger, cfg.SyncBaseURL, cfg.NodeToken,

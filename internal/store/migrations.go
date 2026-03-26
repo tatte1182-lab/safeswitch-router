@@ -21,6 +21,21 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 			last_seen  TEXT NOT NULL,
 			enrolled   INTEGER NOT NULL DEFAULT 0
 		);`,
+
+		// Route profile intent store — one row per device MAC.
+		// This is the authoritative desired state set by guardian commands.
+		// Values: split_tunnel | full_tunnel | service_only
+		// The firewall enforcer reads this to build per-device egress rules.
+		// The command dispatcher reads this to push cooperative updates to clients.
+		`CREATE TABLE IF NOT EXISTS device_route_profiles (
+			mac                     TEXT PRIMARY KEY,
+			route_profile           TEXT NOT NULL DEFAULT 'split_tunnel',
+			route_profile_source    TEXT NOT NULL DEFAULT 'guardian',
+			route_profile_version   INTEGER NOT NULL DEFAULT 1,
+			client_applied          INTEGER NOT NULL DEFAULT 0,
+			client_applied_at       TEXT,
+			updated_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
 	}
 	for i, stmt := range stmts {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
