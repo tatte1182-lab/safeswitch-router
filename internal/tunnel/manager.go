@@ -33,8 +33,8 @@ type PolicyReader interface {
 const (
 	// TunnelSubnet is the WireGuard tunnel address space.
 	// .1 is the router (server), .2+ are client peers.
-	TunnelSubnet = "10.10.0.0/24"
-	TunnelGateway = "10.10.0.1"
+	TunnelSubnet      = "10.10.0.0/24"
+	TunnelGateway     = "10.10.0.1"
 	TunnelGatewayCIDR = "10.10.0.1/24"
 	DefaultListenPort = 51820
 )
@@ -50,7 +50,7 @@ type Manager struct {
 	confWriter *ConfWriter
 	devMode    bool
 
-	mu          sync.RWMutex
+	mu           sync.RWMutex
 	latestHealth *PeerHealthSnapshot
 
 	cancel context.CancelFunc
@@ -113,6 +113,13 @@ func (m *Manager) Stop(ctx context.Context) error {
 }
 
 func (m *Manager) Health(ctx context.Context) error { return nil }
+
+// TriggerSync is called by wiring.go on every policy bundle swap so that
+// new enrollments appear in wg0 immediately — without waiting for the
+// 60-second background ticker.
+func (m *Manager) TriggerSync(ctx context.Context) error {
+	return m.sync(ctx)
+}
 
 // TunnelIPForMAC returns the tunnel IP allocated to a device by MAC address.
 // Returns empty string if not found. Used by the firewall enforcer.
@@ -359,8 +366,7 @@ func (m *Manager) loadPeers(ctx context.Context) ([]PeerConfig, error) {
 }
 
 // loadInterfaceConfig reads the node's WireGuard private key and builds
-// the [Interface] section. The private key is loaded from the identity
-// data dir in production; in dev mode a placeholder is used.
+// the [Interface] section.
 func (m *Manager) loadInterfaceConfig(ctx context.Context) (InterfaceConfig, error) {
 	var privKey string
 	_ = m.db.QueryRowContext(ctx,
