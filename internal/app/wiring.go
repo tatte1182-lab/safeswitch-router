@@ -62,11 +62,37 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 
 	// Firewall enforcer — reads route profiles + policy bundle to build rules.
 	// Chains onto every policy bundle swap.
-	enforcer := firewall.NewEnforcer(db, logger, policyRuntime, tunnelMgr, routeProfileStore, devMode)
+	enforcer := firewall.NewEnforcer(db, routeProfileStore, devMode, logger)
 	policyRuntime.SetOnSwap(func(ctx context.Context) {
-		if err := enforcer.Sync(ctx); err != nil {
+		if err := enforcer.SyncFromBundle(ctx); err != nil {
 			logger.Printf("[wiring] firewall sync after bundle swap: %v", err)
 		}
+	})
+
+	// Wire bundle provider so enforcer can pull children from active policy bundle.
+	enforcer.SetBundleProvider(func() []firewall.Child {
+		bundle, err := policyRuntime.ActiveBundle(context.Background())
+		if err != nil || bundle == nil {
+			return nil
+		}
+		children := make([]firewall.Child, 0, len(bundle.Children))
+		for _, c := range bundle.Children {
+			paused := c.LockEnabled || c.Mode == "paused"
+			routeMode := "split_tunnel"
+			if c.Mode == "full_tunnel" {
+				routeMode = "full_tunnel"
+			}
+			children = append(children, firewall.Child{
+				ChildID:            c.ChildID,
+				DeviceMAC:          c.DeviceMAC,
+				WireguardPublicKey: c.WireGuardPublicKey,
+				WireguardIP:        c.WireguardIP,
+				DisplayName:        c.DNSProfileID,
+				Paused:             paused,
+				RouteMode:          routeMode,
+			})
+		}
+		return children
 	})
 
 	// Command executor — all engines live.

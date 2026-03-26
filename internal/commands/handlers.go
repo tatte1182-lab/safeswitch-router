@@ -30,7 +30,7 @@ type TunnelManager interface {
 type FirewallEnforcer interface {
 	PauseDevice(ctx context.Context, mac string) error
 	UnpauseDevice(ctx context.Context, mac string) error
-	Sync(ctx context.Context) error
+	SyncFromBundle(ctx context.Context) error
 }
 
 // RouteProfileStore persists route profile intent per device.
@@ -133,11 +133,13 @@ func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 				for _, item := range arr {
 					if m, ok := item.(map[string]any); ok {
 						child := policybundle.ChildEffectiveState{
-							ChildID:      stringVal(m, "child_id"),
-							DeviceMAC:    stringVal(m, "device_mac"),
-							Mode:         stringVal(m, "mode"),
-							LockEnabled:  boolVal(m, "lock_enabled"),
-							DNSProfileID: stringVal(m, "dns_profile_id"),
+							ChildID:            stringVal(m, "child_id"),
+							DeviceMAC:          stringVal(m, "device_mac"),
+							WireGuardPublicKey: stringVal(m, "wireguard_public_key"),
+							WireguardIP:        stringVal(m, "wireguard_ip"),
+							Mode:               stringVal(m, "mode"),
+							LockEnabled:        boolVal(m, "lock_enabled"),
+							DNSProfileID:       stringVal(m, "dns_profile_id"),
 						}
 						children = append(children, child)
 					}
@@ -207,7 +209,7 @@ func makeSetRouteProfileHandler(fw FirewallEnforcer, rps RouteProfileStore, logg
 				logger.Printf("[cmd:set_route_profile] intent stored mac=%s profile=%s source=%s", mac, profile, source)
 				// Trigger immediate firewall resync so egress rules reflect new profile.
 				if fw != nil {
-					if err := fw.Sync(ctx); err != nil {
+					if err := fw.SyncFromBundle(ctx); err != nil {
 						logger.Printf("[cmd:set_route_profile] firewall sync warning: %v", err)
 					} else {
 						enforced = true
@@ -363,6 +365,18 @@ func (s *DBRouteProfileStore) SetRouteProfile(ctx context.Context, mac, profile,
 			updated_at           = CURRENT_TIMESTAMP
 	`, mac, profile, source)
 	return err
+}
+
+func (s *DBRouteProfileStore) RouteProfileForKey(ctx context.Context, publicKey string) string {
+	if publicKey == "" {
+		return ""
+	}
+	var profile string
+	_ = s.db.QueryRowContext(ctx,
+		`SELECT route_profile FROM device_route_profiles WHERE public_key = ? ORDER BY rowid DESC LIMIT 1`,
+		publicKey,
+	).Scan(&profile)
+	return profile
 }
 
 func (s *DBRouteProfileStore) RouteProfileForMAC(ctx context.Context, mac string) string {
