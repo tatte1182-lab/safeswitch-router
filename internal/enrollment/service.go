@@ -47,13 +47,13 @@ id := s.identity.Current()
 st := State{NodeID: id.NodeID, PublicKey: id.PublicKey}
 var familyID, enrolledAt string
 if err := s.db.QueryRowContext(ctx,
-`SELECT value FROM node_config WHERE key = 'family_id'`,
+`SELECT value FROM tunnel_config WHERE key = 'family_id'`,
 ).Scan(&familyID); err == nil && familyID != "" {
 st.Enrolled = true
 st.FamilyID = familyID
 }
 if err := s.db.QueryRowContext(ctx,
-`SELECT value FROM node_config WHERE key = 'enrolled_at'`,
+`SELECT value FROM tunnel_config WHERE key = 'enrolled_at'`,
 ).Scan(&enrolledAt); err == nil && enrolledAt != "" {
 st.EnrolledAt, _ = time.Parse(time.RFC3339, enrolledAt)
 }
@@ -138,7 +138,7 @@ return parts[0] + "-" + parts[1] + "-" + parts[2], nil
 
 func (s *Service) setConfig(ctx context.Context, key, value string) error {
 _, err := s.db.ExecContext(ctx, `
-INSERT INTO node_config (key, value) VALUES (?, ?)
+INSERT INTO tunnel_config (key, value) VALUES (?, ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value
 `, key, value)
 return err
@@ -146,7 +146,7 @@ return err
 
 func (s *Service) EnsureSchema(ctx context.Context) error {
 _, err := s.db.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS node_config (
+-- node_config replaced by tunnel_config (
 key   TEXT PRIMARY KEY,
 value TEXT NOT NULL
 );

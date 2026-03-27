@@ -293,7 +293,7 @@ func (s *Service) sendElectionHeartbeat(
 func (s *Service) loadFamilyID(ctx context.Context) string {
 	var familyID string
 	_ = s.db.QueryRowContext(ctx,
-		`SELECT value FROM node_config WHERE key = 'family_id'`,
+		`SELECT value FROM tunnel_config WHERE key = 'family_id'`,
 	).Scan(&familyID)
 	return familyID
 }
