@@ -84,7 +84,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 				DeviceMAC:          c.DeviceMAC,
 				WireguardPublicKey: c.WireGuardPublicKey,
 				WireguardIP:        c.WireguardIP,
-				DisplayName:        c.DNSProfileID,
+				DisplayName:        c.ChildID,
 				Paused:             paused,
 				RouteMode:          routeMode,
 			})
