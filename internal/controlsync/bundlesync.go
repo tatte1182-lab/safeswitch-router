@@ -1,5 +1,4 @@
 package controlsync
-
 import (
 "context"
 "encoding/json"
@@ -27,8 +26,8 @@ s.logger.Printf("[controlsync] bundle response missing version - skipping")
 return
 }
 current, err := s.policyRuntime.ActiveBundle(ctx)
-if err == nil && current != nil && current.Version == b.Version {
-s.logger.Printf("[controlsync] bundle version=%s already active - no swap needed", b.Version)
+if err == nil && current != nil && current.Version == b.Version && len(current.Children) == len(b.Children) {
+s.logger.Printf("[controlsync] bundle version=%s children=%d already active - no swap needed", b.Version, len(b.Children))
 return
 }
 if err := s.policyRuntime.SwapBundle(ctx, &b); err != nil {

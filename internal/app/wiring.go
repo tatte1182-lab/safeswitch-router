@@ -96,7 +96,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	commands.RegisterHandlers(executor, policyRuntime, dnsServer, tunnelMgr, enforcer, routeProfileStore, logger)
 
 	controlSyncSvc := controlsync.NewService(
-		db, logger, cfg.SyncBaseURL, cfg.NodeToken,
+		db, logger, cfg.SyncBaseURL, cfg.NodeToken, cfg.AnonKey,
 		cfg.CommandPollEvery, cfg.HeartbeatEvery,
 		idSvc, journal, policyRuntime, executor,
 	)

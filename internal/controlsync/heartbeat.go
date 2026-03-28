@@ -281,7 +281,7 @@ func (s *Service) sendElectionHeartbeat(
 		return
 	}
 
-	_, statusCode, err := s.client.post(ctx, "/rest/v1/rpc/upsert_node_heartbeat", raw)
+	_, statusCode, err := s.client.postREST(ctx, "/rest/v1/rpc/upsert_node_heartbeat", raw)
 	if err != nil || statusCode >= 400 {
 		s.logger.Printf("[controlsync] election heartbeat RPC failed status=%d: %v", statusCode, err)
 	} else {
