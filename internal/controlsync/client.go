@@ -3,8 +3,10 @@ package controlsync
 import (
 "bytes"
 "context"
+"crypto/tls"
 "fmt"
 "io"
+"net"
 "net/http"
 "time"
 )
@@ -17,14 +19,31 @@ logger    Logger
 http      *http.Client
 }
 
+// tcpResolver forces DNS resolution over TCP to work around environments
+// where outbound UDP port 53 is blocked at the network level.
+var tcpResolver = &net.Resolver{
+PreferGo: true,
+Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+// Port 53 (UDP+TCP) is blocked on this host; use DoH via port 443
+return tls.DialWithDialer(&net.Dialer{}, "tcp", "8.8.8.8:443", nil)
+},
+}
+
 func newClient(baseURL, nodeToken, anonKey string, logger Logger) *client {
+dialer := &net.Dialer{
+Resolver: tcpResolver,
+}
+transport := &http.Transport{
+DialContext: dialer.DialContext,
+}
 return &client{
 baseURL:   baseURL,
 nodeToken: nodeToken,
 anonKey:   anonKey,
 logger:    logger,
 http: &http.Client{
-Timeout: 10 * time.Second,
+Timeout:   10 * time.Second,
+Transport: transport,
 },
 }
 }

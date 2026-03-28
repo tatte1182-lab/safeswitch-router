@@ -63,3 +63,18 @@ func ChainEnsureArgs() [][]string {
 func ChainFlushArgs() []string {
 	return []string{"-F", SSChain}
 }
+
+func EnsureForwardJump() [][]string {
+return [][]string{
+{"-C", "FORWARD", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"},
+{"-C", "FORWARD", "-i", wgIface, "-o", "eth0", "-j", "ACCEPT"},
+{"-C", "FORWARD", "-j", SSChain},
+}
+}
+
+func InsertForwardJump(checkArgs []string) []string {
+args := make([]string, len(checkArgs))
+copy(args, checkArgs)
+args[0] = "-I"
+return append([]string{args[0], "FORWARD", "1"}, args[2:]...)
+}

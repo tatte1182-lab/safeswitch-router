@@ -45,8 +45,12 @@ func (e *Enforcer) Sync(ctx context.Context, children []Child) error {
 		e.logger.Printf("[firewall] devMode sync children=%d", len(children))
 		return nil
 	}
-	for _, args := range ChainEnsureArgs() {
-		exec.Command("iptables", args...).Run()
+	exec.Command("iptables", "-N", SSChain).Run()
+	for _, checkArgs := range EnsureForwardJump() {
+		if err := exec.Command("iptables", checkArgs...).Run(); err != nil {
+			insertArgs := InsertForwardJump(checkArgs)
+			exec.Command("iptables", insertArgs...).Run()
+		}
 	}
 	if err := e.runIPTables(ChainFlushArgs()); err != nil {
 		return fmt.Errorf("flush chain: %w", err)
