@@ -17,6 +17,7 @@ import (
 	"github.com/getsafeswitch/safeswitch-router/internal/policy"
 	"github.com/getsafeswitch/safeswitch-router/internal/presence"
 	"github.com/getsafeswitch/safeswitch-router/internal/store"
+	"github.com/getsafeswitch/safeswitch-router/internal/sinkhole"
 	"github.com/getsafeswitch/safeswitch-router/internal/supervisor"
 	"github.com/getsafeswitch/safeswitch-router/internal/telemetry"
 	"github.com/getsafeswitch/safeswitch-router/internal/tunnel"
@@ -113,6 +114,16 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	sup.Register(healthSvc)
 	sup.Register(presenceEngine)
 	sup.Register(dnsServer)
+
+	// Bind 10.10.0.2 on wg0 so the sinkhole can listen.
+	// If the address is already bound (e.g. after a restart) the error is ignored.
+	if err := sinkhole.EnsureSinkholeAddr(); err != nil {
+		logger.Printf("[wiring] sinkhole addr: %v (continuing)", err)
+	}
+	if err := sinkhole.StartSinkhole(); err != nil {
+		return nil, fmt.Errorf("start sinkhole: %w", err)
+	}
+
 	sup.Register(tunnelMgr)
 	sup.Register(enforcer)
 	sup.Register(controlSyncSvc)
