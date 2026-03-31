@@ -60,35 +60,41 @@ func buildSinkholeA(query []byte, sinkholeIP [4]byte) []byte {
 	if len(query) < 12 {
 		return buildNXDomain(query)
 	}
-	q := query[12:] // question section starts at byte 12
-
-	// Build response: header + question + one A answer RR
-	resp := make([]byte, 0, len(query)+16)
-
-	// Header (12 bytes)
+	m, err := parseQuery(query)
+	if err != nil || len(m.questions) == 0 {
+		return buildNXDomain(query)
+	}
+	var qSection []byte
+	for _, label := range strings.Split(m.questions[0].name, ".") {
+		if label == "" {
+			continue
+		}
+		qSection = append(qSection, byte(len(label)))
+		qSection = append(qSection, []byte(label)...)
+	}
+	qSection = append(qSection, 0x00)
+	qSection = append(qSection, 0x00, 0x01)
+	qSection = append(qSection, 0x00, 0x01)
+	resp := make([]byte, 0, 12+len(qSection)+16)
 	hdr := make([]byte, 12)
 	copy(hdr, query[:12])
 	flags := binary.BigEndian.Uint16(query[2:4])
-	flags |= 0x8000 // QR = response
-	flags |= 0x0080 // RA = recursion available
-	flags &^= 0x000F // zero RCODE
+	flags |= 0x8000
+	flags |= 0x0080
+	flags &^= 0x000F
 	binary.BigEndian.PutUint16(hdr[2:4], flags)
-	binary.BigEndian.PutUint16(hdr[4:6], 1) // QDCOUNT = 1
-	binary.BigEndian.PutUint16(hdr[6:8], 1) // ANCOUNT = 1
+	binary.BigEndian.PutUint16(hdr[4:6], 1)
+	binary.BigEndian.PutUint16(hdr[6:8], 1)
 	binary.BigEndian.PutUint16(hdr[8:10], 0)
 	binary.BigEndian.PutUint16(hdr[10:12], 0)
 	resp = append(resp, hdr...)
-
-	// Question section (copy verbatim)
-	resp = append(resp, q...)
-
-	// Answer RR: NAME (pointer to question), TYPE A, CLASS IN, TTL 5, RDLENGTH 4, RDATA
+	resp = append(resp, qSection...)
 	resp = append(resp,
-		0xC0, 0x0C, // pointer to question name at offset 12
-		0x00, 0x01, // TYPE A
-		0x00, 0x01, // CLASS IN
-		0x00, 0x00, 0x00, 0x05, // TTL 5
-		0x00, 0x04, // RDLENGTH 4
+		0xC0, 0x0C,
+		0x00, 0x01,
+		0x00, 0x01,
+		0x00, 0x00, 0x00, 0x05,
+		0x00, 0x04,
 		sinkholeIP[0], sinkholeIP[1], sinkholeIP[2], sinkholeIP[3],
 	)
 	return resp

@@ -60,7 +60,7 @@ func EnsureSinkholeAddr() error {
 	cmd := exec.Command("ip", "addr", "add", SinkholeAddr+"/32", "dev", "wg0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		// "RTNETLINK answers: File exists" means it's already bound — fine.
-		if !strings.Contains(string(out), "File exists") {
+		if !strings.Contains(string(out), "already") {
 			return fmt.Errorf("ip addr add: %w: %s", err, out)
 		}
 	}
