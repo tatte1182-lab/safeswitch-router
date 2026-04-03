@@ -63,10 +63,11 @@ func (s *Service) Name() string { return "control-sync" }
 func (s *Service) Start(ctx context.Context) error {
 runCtx, cancel := context.WithCancel(ctx)
 s.cancel = cancel
-s.wg.Add(2)
+s.wg.Add(3)
 go s.runHeartbeat(runCtx)
 go s.runCommandPoll(runCtx)
-s.logger.Printf("[controlsync] started")
+go s.runEnforcementSync(runCtx)
+s.logger.Printf("[controlsync] started (heartbeat=%s commandPoll=%s enforcementSync=%s)", s.heartbeatEvery, s.commandPollEvery, enforcementPollEvery)
 return nil
 }
 

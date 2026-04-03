@@ -2,14 +2,14 @@
 //
 // SafeSwitch Sinkhole Server
 //
-// When the DNS engine blocks a domain it returns 10.10.0.2 (the sinkhole IP)
+// When the DNS engine blocks a domain it returns 10.10.0.254 (the sinkhole IP)
 // instead of NXDOMAIN. Any HTTP/HTTPS request to that IP hits this server,
 // which returns a clean branded "blocked" page — exactly like Cisco Umbrella,
 // Circle, or enterprise proxy block pages.
 //
 // Architecture:
-//   DNS query → blocked → returns 10.10.0.2
-//   Browser follows → HTTP request to 10.10.0.2:80
+//   DNS query → blocked → returns 10.10.0.254
+//   Browser follows → HTTP request to 10.10.0.254:80
 //   Sinkhole serves block page with reason + schedule info
 //
 // HTTPS note: HTTPS requests will show a TLS error before reaching the block
@@ -19,8 +19,8 @@
 // (Phase 8 compression stack). For now HTTP domains get the clean page,
 // HTTPS domains get a browser TLS error which is still a hard block.
 //
-// Sinkhole IP: 10.10.0.2 — add this as a second address on wg0:
-//   ip addr add 10.10.0.2/32 dev wg0
+// Sinkhole IP: 10.10.0.254 — add this as a second address on wg0:
+//   ip addr add 10.10.0.254/32 dev wg0
 //   (or set in wg-quick PostUp)
 
 package sinkhole
@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	SinkholeAddr = "10.10.0.2"
+	SinkholeAddr = "10.10.0.254"
 	HTTPPort     = 80
 )
 
@@ -52,7 +52,7 @@ const (
 	ReasonDefault   BlockReason = "blocked"
 )
 
-// EnsureSinkholeAddr binds 10.10.0.2/32 on the wg0 interface so the
+// EnsureSinkholeAddr binds 10.10.0.254/32 on the wg0 interface so the
 // sinkhole server can listen on that address. Safe to call on restart —
 // if the address is already assigned the command exits non-zero and the
 // error is logged but not fatal.

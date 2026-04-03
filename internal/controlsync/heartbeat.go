@@ -165,6 +165,9 @@ func (s *Service) sendHeartbeat(ctx context.Context, startedAt time.Time) {
 	s.sendElectionHeartbeat(ctx, id.NodeID, uptimeSeconds, cpu, mem, disk,
 		tunnelPeers, deviceCount, bundleVersion)
 
+	// --- sync WireGuard peer stats to device_tunnel_stats ---
+	s.syncTunnelStats(ctx)
+
 	_ = s.journal.Append(ctx, contractevents.Event{
 		Type:     "node.heartbeat.sent",
 		Severity: "info",

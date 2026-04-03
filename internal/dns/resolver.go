@@ -9,6 +9,7 @@ import (
 
 type PolicyReader interface {
 	DNSProfileForMAC(mac string) string
+	InternetPausedForIP(ip string) bool
 }
 
 type PresenceReader interface {
@@ -19,11 +20,12 @@ type Logger interface {
 	Printf(format string, v ...any)
 }
 
-// sinkholeIP is the IP the block-page HTTP server listens on (bound to wg0).
-// Blocked A queries return this address; browsers follow and get the block page.
+// sinkholeIP is the sinkhole server address bound to wg0 (10.10.0.254).
+// All sinkholed A queries return this address so the browser reaches the
+// block page HTTP server running on the same host.
 const qTypeA uint16 = 1
 
-var sinkholeIP = [4]byte{10, 10, 0, 2}
+var sinkholeIP = [4]byte{10, 10, 0, 254}
 
 type Resolver struct {
 	blocklist *Blocklist
@@ -45,7 +47,6 @@ func NewResolver(bl *Blocklist, policy PolicyReader, presence PresenceReader, lo
 	}
 }
 
-// SetBlockSink wires a BlockSink. Call before Start.
 func (r *Resolver) SetBlockSink(s BlockSink) {
 	r.sink = s
 }
@@ -59,16 +60,28 @@ func (r *Resolver) Resolve(ctx context.Context, query []byte, srcIP string) []by
 		return buildServFail(query)
 	}
 	domain := m.questions[0].name
-	if r.blocklist.IsBlocked(domain) {
-		r.logger.Printf("[dns] blocked domain=%s src=%s", domain, srcIP)
-		r.sink.RecordBlock(BlockEvent{Domain: domain, SrcIP: srcIP})
-		// For A queries return the sinkhole IP so the browser reaches the
-		// block page. For everything else (AAAA, MX, TXT…) NXDOMAIN is correct.
-		if m.questions[0].qtype == qTypeA {
+	isAQuery := m.questions[0].qtype == qTypeA
+
+	// Priority 1: internet paused — sinkhole ALL domains so browser hits block page
+	if r.policy != nil && r.policy.InternetPausedForIP(srcIP) {
+		if isAQuery {
+			r.logger.Printf("[dns] paused sinkhole domain=%s src=%s", domain, srcIP)
 			return buildSinkholeA(query, sinkholeIP)
 		}
 		return buildNXDomain(query)
 	}
+
+	// Priority 2: blocklist
+	if r.blocklist.IsBlocked(domain) {
+		r.logger.Printf("[dns] blocked domain=%s src=%s", domain, srcIP)
+		r.sink.RecordBlock(BlockEvent{Domain: domain, SrcIP: srcIP})
+		if isAQuery {
+			return buildSinkholeA(query, sinkholeIP)
+		}
+		return buildNXDomain(query)
+	}
+
+	// Priority 3: forward upstream
 	resp, err := r.forward(ctx, query)
 	if err != nil {
 		r.logger.Printf("[dns] upstream failed domain=%s: %v", domain, err)
@@ -118,3 +131,5 @@ func (r *Resolver) forwardOnce(upstream string, query []byte, timeout time.Durat
 	}
 	return buf, nil
 }
+
+// unused import guard

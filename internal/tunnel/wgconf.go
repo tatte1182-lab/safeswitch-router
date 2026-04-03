@@ -129,6 +129,7 @@ func (w *ConfWriter) buildConf(iface InterfaceConfig, peers []PeerConfig) string
 		sb.WriteString("[Peer]\n")
 		sb.WriteString(fmt.Sprintf("PublicKey = %s\n", p.PublicKey))
 		sb.WriteString(fmt.Sprintf("AllowedIPs = %s\n", p.AllowedIP))
+		sb.WriteString(fmt.Sprintf("PersistentKeepalive = 25\n"))
 		sb.WriteString("\n")
 	}
 	return sb.String()
