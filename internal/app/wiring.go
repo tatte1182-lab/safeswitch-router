@@ -102,6 +102,9 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		idSvc, journal, policyRuntime, executor,
 	)
 
+		// Wire DNS block events → activity_log
+	resolver.SetBlockSink(controlSyncSvc.NewActivityWriter(ctx))
+
 	apiSvc := api.NewService(
 		cfg.HTTPListenAddr, db, logger,
 		idSvc, policyRuntime, presenceEngine, controlSyncSvc, tunnelMgr,
@@ -115,7 +118,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	sup.Register(presenceEngine)
 	sup.Register(dnsServer)
 
-	// Bind 10.10.0.2 on wg0 so the sinkhole can listen.
+	// Bind 10.10.0.254 on wg0 so the sinkhole can listen.
 	// If the address is already bound (e.g. after a restart) the error is ignored.
 	if err := sinkhole.EnsureSinkholeAddr(); err != nil {
 		logger.Printf("[wiring] sinkhole addr: %v (continuing)", err)
