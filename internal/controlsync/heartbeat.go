@@ -9,10 +9,10 @@ import (
 
 	contractevents "github.com/getsafeswitch/safeswitch-router/pkg/contract/events"
 	"github.com/getsafeswitch/safeswitch-router/pkg/version"
+
+	"github.com/getsafeswitch/safeswitch-router/internal/enforcer"
 )
 
-// heartbeatPayload is the existing node-heartbeat Edge Function payload.
-// Unchanged — do not remove.
 type heartbeatPayload struct {
 	NodeID              string  `json:"node_id"`
 	NodeName            string  `json:"node_name"`
@@ -26,7 +26,6 @@ type heartbeatPayload struct {
 	DeviceCount         int     `json:"device_count"`
 }
 
-// electionHeartbeat is the new format consumed by the election orchestrator.
 type electionHeartbeat struct {
 	SchemaVersion     int            `json:"schema_version"`
 	FamilyID          string         `json:"family_id"`
@@ -96,7 +95,6 @@ type ehObservations struct {
 	PresenceDevicesSeen int `json:"presence_devices_seen"`
 }
 
-// upsertNodeHeartbeatRPC matches the upsert_node_heartbeat RPC signature.
 type upsertNodeHeartbeatRPC struct {
 	FamilyID       string            `json:"p_family_id"`
 	NodeID         string            `json:"p_node_id"`
@@ -130,12 +128,17 @@ func (s *Service) sendHeartbeat(ctx context.Context, startedAt time.Time) {
 	bundleVersion := "none"
 	if b, err := s.policyRuntime.ActiveBundle(ctx); err == nil && b != nil {
 		bundleVersion = b.Version
+		if !b.ExpiresAt.IsZero() {
+			s.persistBundleExpiry(ctx, b.ExpiresAt)
+		if len(b.EmergencyDomains) > 0 {
+			enforcer.UpdateEmergencyDomains(b.EmergencyDomains)
+		}
+		}
 	}
 	tunnelPeers := s.tunnelPeerCount(ctx)
 	deviceCount := s.deviceCount(ctx)
 	uptimeSeconds := int64(time.Since(startedAt).Seconds())
 
-	// --- existing heartbeat (node-heartbeat Edge Function) — unchanged ---
 	payload := heartbeatPayload{
 		NodeID:              id.NodeID,
 		NodeName:            id.NodeName,
@@ -153,17 +156,23 @@ func (s *Service) sendHeartbeat(ctx context.Context, startedAt time.Time) {
 		s.logger.Printf("[controlsync] heartbeat marshal failed: %v", err)
 		return
 	}
-	_, status, err := s.client.post(ctx, "/functions/v1/node-heartbeat", raw)
-	if err != nil {
-		s.logger.Printf("[controlsync] heartbeat failed status=%d: %v", status, err)
+
+	_, status, heartbeatErr := s.client.post(ctx, "/functions/v1/node-heartbeat", raw)
+	cloudReachable := heartbeatErr == nil && status < 500
+
+	if heartbeatErr != nil {
+		s.logger.Printf("[controlsync] heartbeat failed status=%d: %v", status, heartbeatErr)
 	} else {
 		s.logger.Printf("[controlsync] heartbeat sent node_id=%s uptime=%ds bundle=%s peers=%d devices=%d",
 			id.NodeID, uptimeSeconds, bundleVersion, tunnelPeers, deviceCount)
 	}
 
-	// --- election heartbeat (upsert_node_heartbeat RPC) ---
+	bundleExpiresAt := s.loadBundleExpiry(ctx)
+	gracePeriod := s.loadFailsafeGrace(ctx)
+	enforcer.CheckAndEnterFailsafe(ctx, bundleExpiresAt, cloudReachable, gracePeriod)
+
 	s.sendElectionHeartbeat(ctx, id.NodeID, uptimeSeconds, cpu, mem, disk,
-		tunnelPeers, deviceCount, bundleVersion)
+		tunnelPeers, deviceCount, bundleVersion, cloudReachable)
 
 	// --- sync WireGuard peer stats to device_tunnel_stats ---
 	s.syncTunnelStats(ctx)
@@ -172,9 +181,10 @@ func (s *Service) sendHeartbeat(ctx context.Context, startedAt time.Time) {
 		Type:     "node.heartbeat.sent",
 		Severity: "info",
 		Payload: map[string]any{
-			"node_id": id.NodeID,
-			"uptime":  uptimeSeconds,
-			"bundle":  bundleVersion,
+			"node_id":         id.NodeID,
+			"uptime":          uptimeSeconds,
+			"bundle":          bundleVersion,
+			"cloud_reachable": cloudReachable,
 		},
 	})
 }
@@ -186,6 +196,7 @@ func (s *Service) sendElectionHeartbeat(
 	cpu, mem, disk float64,
 	tunnelPeers, deviceCount int,
 	bundleVersion string,
+	cloudReachable bool,
 ) {
 	familyID := s.loadFamilyID(ctx)
 	if familyID == "" {
@@ -206,6 +217,12 @@ func (s *Service) sendElectionHeartbeat(
 	if disk > 90 {
 		healthScore -= 10
 	}
+	if !cloudReachable {
+		healthScore -= 15
+	}
+	if fsActive, _ := enforcer.GetFailsafeState(); fsActive {
+		healthScore -= 25
+	}
 	if healthScore < 0 {
 		healthScore = 0
 	}
@@ -213,6 +230,13 @@ func (s *Service) sendElectionHeartbeat(
 	dnsOK := s.isDNSAlive(ctx)
 	wgOK := tunnelPeers >= 0
 	policyOK := bundleVersion != "none" && bundleVersion != ""
+
+	registrationState := "active"
+	if fsActive, _ := enforcer.GetFailsafeState(); fsActive {
+		registrationState = "failsafe"
+	} else if !cloudReachable {
+		registrationState = "degraded"
+	}
 
 	hb := electionHeartbeat{
 		SchemaVersion:     1,
@@ -222,9 +246,9 @@ func (s *Service) sendElectionHeartbeat(
 		SentAt:            now.Format(time.RFC3339Nano),
 		AgentVersion:      version.Version,
 		CapabilityHash:    capabilityHash(nodeID),
-		RegistrationState: "active",
+		RegistrationState: registrationState,
 		Connectivity: ehConnectivity{
-			CloudConnected: true,
+			CloudConnected: cloudReachable,
 			LANOK:          true,
 			InternetOK:     true,
 			RTTToCloudMS:   0,
@@ -273,7 +297,7 @@ func (s *Service) sendElectionHeartbeat(
 		SentAt:         now.Format(time.RFC3339Nano),
 		Heartbeat:      hb,
 		HealthScore:    healthScore,
-		CloudConnected: true,
+		CloudConnected: cloudReachable,
 		LANOK:          true,
 		InternetOK:     true,
 	}
@@ -288,9 +312,47 @@ func (s *Service) sendElectionHeartbeat(
 	if err != nil || statusCode >= 400 {
 		s.logger.Printf("[controlsync] election heartbeat RPC failed status=%d: %v", statusCode, err)
 	} else {
-		s.logger.Printf("[controlsync] election heartbeat ok node_id=%s health=%d dns=%v wg=%v",
-			nodeID, healthScore, dnsOK, wgOK)
+		s.logger.Printf("[controlsync] election heartbeat ok node_id=%s health=%d dns=%v wg=%v cloud=%v state=%s",
+			nodeID, healthScore, dnsOK, wgOK, cloudReachable, registrationState)
 	}
+}
+
+func (s *Service) loadBundleExpiry(ctx context.Context) time.Time {
+	var raw string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM tunnel_config WHERE key = 'bundle_expires_at'`,
+	).Scan(&raw)
+	if err != nil || raw == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+func (s *Service) persistBundleExpiry(ctx context.Context, expiresAt time.Time) {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO tunnel_config (key, value) VALUES ('bundle_expires_at', ?)`,
+		expiresAt.UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		s.logger.Printf("[controlsync] failed to persist bundle_expires_at: %v", err)
+	}
+}
+
+func (s *Service) loadFailsafeGrace(ctx context.Context) time.Duration {
+	var raw string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM tunnel_config WHERE key = 'failsafe_grace_seconds'`,
+	).Scan(&raw)
+	if err != nil || raw == "" {
+		return 0
+	}
+	var secs int64
+	fmt.Sscan(raw, &secs)
+	return time.Duration(secs) * time.Second
 }
 
 func (s *Service) loadFamilyID(ctx context.Context) string {

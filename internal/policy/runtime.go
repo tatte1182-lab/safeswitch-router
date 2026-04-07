@@ -19,11 +19,16 @@ type Runtime struct {
 	logger Logger
 	mu     sync.RWMutex
 	active *contract.Bundle
+
+	// onSwap is called after every successful bundle swap.
+	// Used by the firewall enforcer to chain rule resyncs.
+	// Registered via SetOnSwap — nil is safe (no-op).
 	onSwap func(ctx context.Context)
 }
 
 func NewRuntime(db *sql.DB, logger Logger) *Runtime { return &Runtime{db: db, logger: logger} }
 
+// SetOnSwap registers a callback that fires after every SwapBundle.
 func (r *Runtime) SetOnSwap(fn func(ctx context.Context)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -74,12 +79,15 @@ func (r *Runtime) SwapBundle(ctx context.Context, b *contract.Bundle) error {
 	cb := r.onSwap
 	r.mu.Unlock()
 	r.logger.Printf("[policy] swapped bundle version=%s", b.Version)
+	// Fire firewall sync callback outside the lock — Sync() will re-acquire its own lock
 	if cb != nil {
 		cb(ctx)
 	}
 	return nil
 }
 
+// DNSProfileForMAC returns the dns_profile_id for the child whose enrolled
+// device MAC matches. Returns "default" when no match is found or no bundle loaded.
 func (r *Runtime) DNSProfileForMAC(mac string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -99,26 +107,35 @@ func (r *Runtime) DNSProfileForMAC(mac string) string {
 
 // InternetPausedForIP returns true when the policy engine has marked the
 // device with the given tunnel IP as paused (internet blocked).
-// Uses same logic as wiring.go: paused = LockEnabled || Mode == "paused"
+// Called by the DNS resolver on every query to decide whether to sinkhole.
+// Uses the in-memory bundle — no DB round-trip, safe to call on hot path.
 func (r *Runtime) InternetPausedForIP(ip string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.active == nil {
 		return false
 	}
+	// Strip /32 suffix if present
 	cleanIP := strings.TrimSuffix(ip, "/32")
 	for _, child := range r.active.Children {
 		childIP := strings.TrimSuffix(child.WireguardIP, "/32")
 		if childIP == cleanIP {
+			// Mirror the pause logic in wiring.go:
+			// paused := c.LockEnabled || c.Mode == "paused"
 			return child.LockEnabled || child.Mode == "paused"
 		}
 	}
 	return false
 }
 
+// EnrolledMACs returns a set of device MACs present in the active policy bundle.
+// The presence engine uses this to mark devices as enrolled without importing
+// the full policy package.
+// Returns an empty map (never nil) when no bundle is loaded.
 func (r *Runtime) EnrolledMACs(ctx context.Context) map[string]bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
 	result := make(map[string]bool)
 	if r.active == nil {
 		return result

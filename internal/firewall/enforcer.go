@@ -45,9 +45,12 @@ func (e *Enforcer) Sync(ctx context.Context, children []Child) error {
 		e.logger.Printf("[firewall] devMode sync children=%d", len(children))
 		return nil
 	}
+	// Create chain if absent (idempotent — -N fails silently if exists)
 	exec.Command("iptables", "-N", SSChain).Run()
+	// Ensure FORWARD base rules exist exactly once
 	for _, checkArgs := range EnsureForwardJump() {
 		if err := exec.Command("iptables", checkArgs...).Run(); err != nil {
+			// Rule absent — insert it
 			insertArgs := InsertForwardJump(checkArgs)
 			exec.Command("iptables", insertArgs...).Run()
 		}
@@ -186,8 +189,12 @@ func (e *Enforcer) PauseDevice(ctx context.Context, mac string) error {
 		e.logger.Printf("[firewall] devMode PauseDevice mac=%s", mac)
 		return nil
 	}
-	for _, args := range ChainEnsureArgs() {
-		exec.Command("iptables", args...).Run()
+	exec.Command("iptables", "-N", SSChain).Run()
+	for _, checkArgs := range EnsureForwardJump() {
+		if err := exec.Command("iptables", checkArgs...).Run(); err != nil {
+			insertArgs := InsertForwardJump(checkArgs)
+			exec.Command("iptables", insertArgs...).Run()
+		}
 	}
 	rs := BuildRules(mac, StatePaused)
 	for _, rule := range rs.Rules {

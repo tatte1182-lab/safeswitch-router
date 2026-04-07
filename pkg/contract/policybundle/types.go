@@ -6,7 +6,8 @@ type Bundle struct {
 	Version   string               `json:"version"`
 	IssuedAt  time.Time            `json:"issued_at"`
 	ExpiresAt time.Time            `json:"expires_at"`
-	Signature string               `json:"signature"`
+	Signature        string   `json:"signature"`
+	EmergencyDomains []string `json:"emergency_domains,omitempty"`
 	Children  []ChildEffectiveState `json:"children"`
 }
 

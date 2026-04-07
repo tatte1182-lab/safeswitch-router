@@ -9,6 +9,8 @@ import (
 
 type PolicyReader interface {
 	DNSProfileForMAC(mac string) string
+	// InternetPausedForIP returns true when the policy engine has blocked
+	// internet for the device with the given tunnel IP.
 	InternetPausedForIP(ip string) bool
 }
 
@@ -20,7 +22,7 @@ type Logger interface {
 	Printf(format string, v ...any)
 }
 
-// sinkholeIP is the sinkhole server address bound to wg0 (10.10.0.254).
+// sinkholeIP is the sinkhole server address bound to wg0 (10.10.0.2).
 // All sinkholed A queries return this address so the browser reaches the
 // block page HTTP server running on the same host.
 const qTypeA uint16 = 1
@@ -47,6 +49,7 @@ func NewResolver(bl *Blocklist, policy PolicyReader, presence PresenceReader, lo
 	}
 }
 
+// SetBlockSink wires a BlockSink. Call before Start.
 func (r *Resolver) SetBlockSink(s BlockSink) {
 	r.sink = s
 }
@@ -62,16 +65,20 @@ func (r *Resolver) Resolve(ctx context.Context, query []byte, srcIP string) []by
 	domain := m.questions[0].name
 	isAQuery := m.questions[0].qtype == qTypeA
 
-	// Priority 1: internet paused — sinkhole ALL domains so browser hits block page
+	// ── Priority 1: internet_paused — sinkhole ALL domains ───────────────────
+	// When the policy engine has paused internet for this device, every A query
+	// returns the block page IP so the browser shows the SafeSwitch page instead
+	// of a raw connection error or cached content loading silently.
 	if r.policy != nil && r.policy.InternetPausedForIP(srcIP) {
 		if isAQuery {
 			r.logger.Printf("[dns] paused sinkhole domain=%s src=%s", domain, srcIP)
 			return buildSinkholeA(query, sinkholeIP)
 		}
+		// AAAA / other record types → NXDOMAIN so IPv6 falls back to IPv4
 		return buildNXDomain(query)
 	}
 
-	// Priority 2: blocklist
+	// ── Priority 2: blocklist — sinkhole blocked domains ─────────────────────
 	if r.blocklist.IsBlocked(domain) {
 		r.logger.Printf("[dns] blocked domain=%s src=%s", domain, srcIP)
 		r.sink.RecordBlock(BlockEvent{Domain: domain, SrcIP: srcIP})
@@ -81,7 +88,7 @@ func (r *Resolver) Resolve(ctx context.Context, query []byte, srcIP string) []by
 		return buildNXDomain(query)
 	}
 
-	// Priority 3: forward upstream
+	// ── Priority 3: forward to upstream ──────────────────────────────────────
 	resp, err := r.forward(ctx, query)
 	if err != nil {
 		r.logger.Printf("[dns] upstream failed domain=%s: %v", domain, err)
@@ -131,5 +138,3 @@ func (r *Resolver) forwardOnce(upstream string, query []byte, timeout time.Durat
 	}
 	return buf, nil
 }
-
-// unused import guard

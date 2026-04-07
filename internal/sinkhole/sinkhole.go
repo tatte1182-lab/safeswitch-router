@@ -12,16 +12,18 @@
 //   Browser follows → HTTP request to 10.10.0.254:80
 //   Sinkhole serves block page with reason + schedule info
 //
+// IMPORTANT: The sinkhole IP must never be a device tunnel IP.
+// Device IPs are in the 10.10.0.2–10.10.0.253 range (assigned by enrollment).
+// 10.10.0.254 is reserved as the sinkhole address and is never assigned to
+// a device. Using a device IP (e.g. 10.10.0.2) as the sinkhole address causes
+// the VPS to claim that IP as its own, breaking return routing for that device.
+//
 // HTTPS note: HTTPS requests will show a TLS error before reaching the block
 // page because the sinkhole doesn't have a cert for the blocked domain.
 // This is the same behavior as all DNS-based blockers. The correct fix for
 // HTTPS is a transparent HTTPS proxy with a root CA installed at enrollment
 // (Phase 8 compression stack). For now HTTP domains get the clean page,
 // HTTPS domains get a browser TLS error which is still a hard block.
-//
-// Sinkhole IP: 10.10.0.254 — add this as a second address on wg0:
-//   ip addr add 10.10.0.254/32 dev wg0
-//   (or set in wg-quick PostUp)
 
 package sinkhole
 
@@ -45,11 +47,11 @@ const (
 type BlockReason string
 
 const (
-	ReasonSchedule  BlockReason = "schedule"
-	ReasonParent    BlockReason = "parent"
-	ReasonSafety    BlockReason = "safety"
-	ReasonBedtime   BlockReason = "bedtime"
-	ReasonDefault   BlockReason = "blocked"
+	ReasonSchedule BlockReason = "schedule"
+	ReasonParent   BlockReason = "parent"
+	ReasonSafety   BlockReason = "safety"
+	ReasonBedtime  BlockReason = "bedtime"
+	ReasonDefault  BlockReason = "blocked"
 )
 
 // EnsureSinkholeAddr binds 10.10.0.254/32 on the wg0 interface so the
@@ -60,7 +62,7 @@ func EnsureSinkholeAddr() error {
 	cmd := exec.Command("ip", "addr", "add", SinkholeAddr+"/32", "dev", "wg0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		// "RTNETLINK answers: File exists" means it's already bound — fine.
-		if !strings.Contains(string(out), "already") {
+		if !strings.Contains(string(out), "File exists") {
 			return fmt.Errorf("ip addr add: %w: %s", err, out)
 		}
 	}
