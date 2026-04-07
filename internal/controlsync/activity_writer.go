@@ -16,8 +16,6 @@ import (
 // dropped. DNS resolution must never block on logging.
 const activityWriterBufSize = 512
 
-// activityFlushInterval controls how often queued events are sent to Supabase.
-const activityFlushInterval = 10 * time.Second
 
 // ActivityWriter implements dns.BlockSink.
 // RecordBlock is non-blocking. A background goroutine batches and flushes
@@ -140,8 +138,8 @@ func (aw *ActivityWriter) flush(ctx context.Context, batch []dns.BlockEvent) {
 	_, status, err := aw.svc.client.postRESTPrefer(
 		flushCtx,
 		"/rest/v1/activity_log",
-		raw,
 		"resolution=ignore-duplicates",
+		raw,
 	)
 	if err != nil || status >= 400 {
 		aw.svc.logger.Printf("[activity_writer] flush failed status=%d domains=%d: %v",

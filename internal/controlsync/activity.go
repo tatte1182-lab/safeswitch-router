@@ -34,13 +34,13 @@ type activityRow struct {
 type ActivitySink struct {
 	ch     chan dns.BlockEvent
 	db     *sql.DB
-	client *supabaseClient
+	client *client
 	logger interface{ Printf(string, ...any) }
 }
 
 func NewActivitySink(
 	db *sql.DB,
-	client *supabaseClient,
+	client *client,
 	logger interface{ Printf(string, ...any) },
 ) *ActivitySink {
 	return &ActivitySink{
