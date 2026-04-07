@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -237,19 +238,39 @@ func (m *Manager) sync(ctx context.Context) error {
 		return nil
 	}
 
-	// Upsert any peers from the bundle that aren't in tunnel_peers yet
+	// Reconcile tunnel_peers against bundle using WireguardIP as stable identity.
+	// If a device re-enrolls with a new key, the IP stays the same but the key
+	// changes — update the key rather than accumulating stale rows.
+	bundleKeys := make(map[string]bool)
 	for _, child := range bundle.Children {
-		if child.WireGuardPublicKey == "" {
+		if child.WireGuardPublicKey == "" || child.WireguardIP == "" {
 			continue
 		}
-		var existing string
+		bundleKeys[child.WireGuardPublicKey] = true
+
+		allowedIP := child.WireguardIP
+		if !strings.Contains(allowedIP, "/") {
+			allowedIP = allowedIP + "/32"
+		}
+
+		var existingKey string
 		_ = m.db.QueryRowContext(ctx,
-			`SELECT public_key FROM tunnel_peers WHERE public_key = ?`,
-			child.WireGuardPublicKey,
-		).Scan(&existing)
-		if existing != "" {
-			continue
+			`SELECT public_key FROM tunnel_peers WHERE allowed_ip = ?`,
+			allowedIP,
+		).Scan(&existingKey)
+
+		if existingKey == child.WireGuardPublicKey {
+			continue // already correct
 		}
+
+		if existingKey != "" {
+			// Stale key on this IP slot — evict before re-adding
+			m.logger.Printf("[tunnel] stale key on %s: replacing %s with %s",
+				allowedIP, existingKey[:8]+"...", child.WireGuardPublicKey[:8]+"...")
+			_, _ = m.db.ExecContext(ctx,
+				`DELETE FROM tunnel_peers WHERE allowed_ip = ?`, allowedIP)
+		}
+
 		if _, err := m.AddPeer(ctx, child.WireGuardPublicKey, child.DeviceMAC, child.ChildID); err != nil {
 			m.logger.Printf("[tunnel] auto-add peer child=%s: %v", child.ChildID, err)
 		}
