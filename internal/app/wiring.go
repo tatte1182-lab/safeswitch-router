@@ -16,11 +16,12 @@ import (
 	"github.com/getsafeswitch/safeswitch-router/internal/identity"
 	"github.com/getsafeswitch/safeswitch-router/internal/policy"
 	"github.com/getsafeswitch/safeswitch-router/internal/presence"
-	"github.com/getsafeswitch/safeswitch-router/internal/store"
 	"github.com/getsafeswitch/safeswitch-router/internal/sinkhole"
+	"github.com/getsafeswitch/safeswitch-router/internal/store"
 	"github.com/getsafeswitch/safeswitch-router/internal/supervisor"
 	"github.com/getsafeswitch/safeswitch-router/internal/telemetry"
 	"github.com/getsafeswitch/safeswitch-router/internal/tunnel"
+	"github.com/getsafeswitch/safeswitch-router/mitm"
 )
 
 func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
@@ -102,13 +103,33 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		idSvc, journal, policyRuntime, executor,
 	)
 
-		// Wire DNS block events → activity_log
+	// Wire DNS block events → activity_log
 	resolver.SetBlockSink(controlSyncSvc.NewActivityWriter(ctx))
 
 	apiSvc := api.NewService(
 		cfg.HTTPListenAddr, db, logger,
 		idSvc, policyRuntime, presenceEngine, controlSyncSvc, tunnelMgr,
 	)
+
+	// Load MITM CA and wire into API + proxy
+	ca, err := mitm.LoadCA(
+		"/root/ss-data/ca/ca.crt",
+		"/root/ss-data/ca/ca.key",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load mitm CA: %w", err)
+	}
+	apiSvc.SetCAProvider(ca)
+	mitmProxy := &mitm.Proxy{
+		CA:        ca,
+		Blocklist: blocklist,
+		Port:      8080,
+	}
+	go func() {
+		if err := mitmProxy.ListenAndServe(); err != nil {
+			logger.Printf("[mitm] proxy error: %v", err)
+		}
+	}()
 
 	sup := supervisor.New(logger)
 	sup.Register(idSvc)

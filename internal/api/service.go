@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"sync"
 
@@ -27,6 +29,14 @@ type CommandEnqueuer interface {
 	EnqueueCommand(ctx context.Context, cmd contractcmds.Command) error
 }
 
+// CAProvider is satisfied by *mitm.CA — kept as an interface so the api
+// package does not import the mitm package directly.
+type CAProvider interface {
+	RawCert() []byte
+	Subject() string
+	NotAfter() string
+}
+
 type Service struct {
 	addr           string
 	db             *sql.DB
@@ -36,6 +46,7 @@ type Service struct {
 	presenceEngine PresenceReader
 	cmdEnqueuer    CommandEnqueuer
 	tunnelHealth   tunnel.TunnelHealth
+	caProvider     CAProvider // nil if MITM not configured
 	server         *http.Server
 	wg             sync.WaitGroup
 }
@@ -62,7 +73,13 @@ func NewService(
 	}
 }
 
-func (s *Service) Name() string               { return "local-api" }
+// SetCAProvider wires the MITM CA into the API so it can serve /ca/cert and /ca/info.
+// Call this from wiring.go after loading the CA, before Start().
+func (s *Service) SetCAProvider(ca CAProvider) {
+	s.caProvider = ca
+}
+
+func (s *Service) Name() string                { return "local-api" }
 func (s *Service) Health(ctx context.Context) error { return nil }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -73,6 +90,14 @@ func (s *Service) Start(ctx context.Context) error {
 	mux.HandleFunc("/v1/devices", s.handleDevices)
 	mux.HandleFunc("/v1/commands", s.handleCommands)
 	mux.HandleFunc("/v1/tunnel", s.handleTunnel)
+
+	// CA endpoints — registered only when MITM is configured
+	if s.caProvider != nil {
+		mux.HandleFunc("/ca/cert", s.handleCACert)
+		mux.HandleFunc("/ca/info", s.handleCAInfo)
+		log.Println("[api] CA endpoints registered at /ca/cert and /ca/info")
+	}
+
 	s.server = &http.Server{Addr: s.addr, Handler: mux}
 	s.wg.Add(1)
 	go func() {
@@ -93,6 +118,29 @@ func (s *Service) Stop(ctx context.Context) error {
 	}
 	s.wg.Wait()
 	return nil
+}
+
+func (s *Service) handleCACert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.logger.Printf("[api] CA cert requested from %s", r.RemoteAddr)
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.Header().Set("Content-Disposition", `attachment; filename="safeswitch-ca.pem"`)
+	w.Write(s.caProvider.RawCert())
+}
+
+func (s *Service) handleCAInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"subject":%q,"not_after":%q}`,
+		s.caProvider.Subject(),
+		s.caProvider.NotAfter(),
+	)
 }
 
 func (s *Service) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -130,9 +178,6 @@ func (s *Service) handleDevices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"devices": devices, "count": len(devices)})
 }
 
-// handleCommands accepts POST requests to inject commands locally.
-// Body: {"type": "ping", "payload": {}}
-// Used for dev/testing. In production, commands arrive via Supabase poll (R6).
 func (s *Service) handleCommands(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "POST only"})
@@ -175,7 +220,6 @@ func (s *Service) handleCommands(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleTunnel returns the current WireGuard interface state and peer health.
 func (s *Service) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	snap := s.tunnelHealth.LatestHealth(r.Context())
 	writeJSON(w, http.StatusOK, snap.ToMap())
