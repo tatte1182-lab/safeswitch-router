@@ -2,7 +2,6 @@ package dns
 
 import (
 	"context"
-	"io"
 	"net"
 	"time"
 )
@@ -45,7 +44,7 @@ func NewResolver(bl *Blocklist, policy PolicyReader, presence PresenceReader, lo
 		presence:  presence,
 		logger:    logger,
 		sink:      NoopBlockSink{},
-		upstreams: []string{"185.228.168.168:53", "185.228.169.168:53", "1.1.1.3:53"},
+		upstreams: []string{"1.1.1.1:53", "8.8.8.8:53"},
 	}
 }
 
@@ -114,27 +113,24 @@ func (r *Resolver) forward(ctx context.Context, query []byte) ([]byte, error) {
 }
 
 func (r *Resolver) forwardOnce(upstream string, query []byte, timeout time.Duration) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", upstream, timeout)
+	dialer := &net.Dialer{
+		Timeout:   timeout,
+		LocalAddr: &net.UDPAddr{IP: net.IPv4zero, Port: 0},
+	}
+	conn, err := dialer.Dial("udp", upstream)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
-	msg := make([]byte, 2+len(query))
-	msg[0] = byte(len(query) >> 8)
-	msg[1] = byte(len(query))
-	copy(msg[2:], query)
-	if _, err := conn.Write(msg); err != nil {
+	if _, err := conn.Write(query); err != nil {
 		return nil, err
 	}
-	lenBuf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
 		return nil, err
 	}
-	respLen := int(lenBuf[0])<<8 | int(lenBuf[1])
-	buf := make([]byte, respLen)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
+	return buf[:n], nil
 }
+
