@@ -51,7 +51,7 @@ func RegisterHandlers(e *Executor, policy PolicySwapper, dnsServer DNSReloader, 
 	e.Register("restart", makeRestartHandler(logger))
 }
 
-// ── ping ─────────────────────────────────────────────────────────────────────
+// â”€â”€ ping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func makePingHandler(logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -63,7 +63,7 @@ func makePingHandler(logger Logger) Handler {
 	}
 }
 
-// ── pause_device ──────────────────────────────────────────────────────────────
+// â”€â”€ pause_device â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func makePauseDeviceHandler(fw FirewallEnforcer, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -72,7 +72,7 @@ func makePauseDeviceHandler(fw FirewallEnforcer, logger Logger) Handler {
 			return nil, err
 		}
 		if fw == nil {
-			logger.Printf("[cmd:pause_device] firewall not running — recorded only mac=%s", mac)
+			logger.Printf("[cmd:pause_device] firewall not running â€” recorded only mac=%s", mac)
 			return map[string]any{"mac": mac, "paused": true, "enforced": false}, nil
 		}
 		if err := fw.PauseDevice(ctx, mac); err != nil {
@@ -90,7 +90,7 @@ func makeUnpauseDeviceHandler(fw FirewallEnforcer, logger Logger) Handler {
 			return nil, err
 		}
 		if fw == nil {
-			logger.Printf("[cmd:unpause_device] firewall not running — recorded only mac=%s", mac)
+			logger.Printf("[cmd:unpause_device] firewall not running â€” recorded only mac=%s", mac)
 			return map[string]any{"mac": mac, "paused": false, "enforced": false}, nil
 		}
 		if err := fw.UnpauseDevice(ctx, mac); err != nil {
@@ -101,7 +101,7 @@ func makeUnpauseDeviceHandler(fw FirewallEnforcer, logger Logger) Handler {
 	}
 }
 
-// ── update_policy ─────────────────────────────────────────────────────────────
+// â”€â”€ update_policy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -140,6 +140,7 @@ func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 							Mode:               stringVal(m, "mode"),
 							LockEnabled:        boolVal(m, "lock_enabled"),
 							DNSProfileID:       stringVal(m, "dns_profile_id"),
+							BlockedCategories:  stringSliceVal(m, "blocked_categories"),
 						}
 						children = append(children, child)
 					}
@@ -163,7 +164,7 @@ func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 	}
 }
 
-// ── set_route_profile ─────────────────────────────────────────────────────────
+// â”€â”€ set_route_profile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Payload: {"profile": "full_tunnel|split_tunnel|service_only", "device_mac": "aa:bb:cc:dd:ee:ff"}
 //
 // Enforcement model: A-first, B-assisted.
@@ -200,7 +201,7 @@ func makeSetRouteProfileHandler(fw FirewallEnforcer, rps RouteProfileStore, logg
 			source = "guardian"
 		}
 
-		// Option A — persist intent and enforce immediately at the node.
+		// Option A â€” persist intent and enforce immediately at the node.
 		enforced := false
 		if rps != nil {
 			if err := rps.SetRouteProfile(ctx, mac, profile, source); err != nil {
@@ -218,10 +219,10 @@ func makeSetRouteProfileHandler(fw FirewallEnforcer, rps RouteProfileStore, logg
 			}
 		}
 
-		// Option B — mark client_applied=false so dispatcher can push cooperative
+		// Option B â€” mark client_applied=false so dispatcher can push cooperative
 		// update to child app. The dispatcher will send a set_route_profile command
 		// to the device, which updates its WireGuard AllowedIPs client-side.
-		// This is best-effort only — enforcement does not depend on it.
+		// This is best-effort only â€” enforcement does not depend on it.
 		logger.Printf("[cmd:set_route_profile] applied mac=%s profile=%s enforced=%v client_sync=pending", mac, profile, enforced)
 
 		return map[string]any{
@@ -234,12 +235,12 @@ func makeSetRouteProfileHandler(fw FirewallEnforcer, rps RouteProfileStore, logg
 	}
 }
 
-// ── reload_dns_profile ────────────────────────────────────────────────────────
+// â”€â”€ reload_dns_profile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func makeReloadDNSProfileHandler(dns DNSReloader, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
 		if dns == nil {
-			logger.Printf("[cmd:reload_dns_profile] dns server not running — skipping")
+			logger.Printf("[cmd:reload_dns_profile] dns server not running â€” skipping")
 			return map[string]any{"reloaded": false, "reason": "dns_server_not_running"}, nil
 		}
 		if err := dns.Reload(ctx); err != nil {
@@ -250,7 +251,7 @@ func makeReloadDNSProfileHandler(dns DNSReloader, logger Logger) Handler {
 	}
 }
 
-// ── add_peer ──────────────────────────────────────────────────────────────────
+// â”€â”€ add_peer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func makeAddPeerHandler(mgr TunnelManager, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -277,7 +278,7 @@ func makeAddPeerHandler(mgr TunnelManager, logger Logger) Handler {
 	}
 }
 
-// ── remove_peer ───────────────────────────────────────────────────────────────
+// â”€â”€ remove_peer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func makeRemovePeerHandler(mgr TunnelManager, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -296,7 +297,7 @@ func makeRemovePeerHandler(mgr TunnelManager, logger Logger) Handler {
 	}
 }
 
-// ── restart ───────────────────────────────────────────────────────────────────
+// â”€â”€ restart â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func makeRestartHandler(logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -309,7 +310,7 @@ func makeRestartHandler(logger Logger) Handler {
 	}
 }
 
-// ── payload helpers ───────────────────────────────────────────────────────────
+// â”€â”€ payload helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func requireString(payload map[string]any, key string) (string, error) {
 	v, ok := payload[key]
@@ -344,7 +345,19 @@ func boolVal(m map[string]any, key string) bool {
 	return false
 }
 
-// DB-backed RouteProfileStore — used by the firewall enforcer and wiring.
+func stringSliceVal(m map[string]any, key string) []string {
+        v, ok := m[key]
+        if !ok || v == nil { return nil }
+        arr, ok := v.([]any)
+        if !ok { return nil }
+        out := make([]string, 0, len(arr))
+        for _, item := range arr {
+                if s, ok := item.(string); ok && s != "" { out = append(out, s) }
+        }
+        return out
+}
+
+// DB-backed RouteProfileStore â€” used by the firewall enforcer and wiring.
 type DBRouteProfileStore struct {
 	db *sql.DB
 }
