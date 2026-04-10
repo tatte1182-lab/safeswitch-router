@@ -3,12 +3,12 @@ package policybundle
 import "time"
 
 type Bundle struct {
-	Version   string               `json:"version"`
-	IssuedAt  time.Time            `json:"issued_at"`
-	ExpiresAt time.Time            `json:"expires_at"`
-	Signature        string   `json:"signature"`
-	EmergencyDomains []string `json:"emergency_domains,omitempty"`
-	Children  []ChildEffectiveState `json:"children"`
+	Version          string                `json:"version"`
+	IssuedAt         time.Time             `json:"issued_at"`
+	ExpiresAt        time.Time             `json:"expires_at"`
+	Signature        string                `json:"signature"`
+	EmergencyDomains []string              `json:"emergency_domains,omitempty"`
+	Children         []ChildEffectiveState `json:"children"`
 }
 
 type ChildEffectiveState struct {
@@ -20,4 +20,8 @@ type ChildEffectiveState struct {
 	LockEnabled        bool     `json:"lock_enabled"`
 	DNSProfileID       string   `json:"dns_profile_id"`
 	AllowedServices    []string `json:"allowed_services,omitempty"`
+	// BlockedCategories lists dns_blocklist categories enforced for this child.
+	// e.g. ["adult", "gambling", "social", "gaming", "ads"]
+	// Empty = only the global malware blocklist applies.
+	BlockedCategories []string `json:"blocked_categories,omitempty"`
 }

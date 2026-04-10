@@ -11,6 +11,10 @@ type PolicyReader interface {
 	// InternetPausedForIP returns true when the policy engine has blocked
 	// internet for the device with the given tunnel IP.
 	InternetPausedForIP(ip string) bool
+	// BlockedCategoriesForIP returns the list of blocked DNS categories for
+	// the child device with the given tunnel IP. Returns nil when no extra
+	// category blocking applies.
+	BlockedCategoriesForIP(ip string) []string
 }
 
 type PresenceReader interface {
@@ -21,9 +25,8 @@ type Logger interface {
 	Printf(format string, v ...any)
 }
 
-// sinkholeIP is the sinkhole server address bound to wg0 (10.10.0.2).
-// All sinkholed A queries return this address so the browser reaches the
-// block page HTTP server running on the same host.
+// sinkholeIP is bound to wg0. All sinkholed A queries return this address
+// so the browser reaches the block page HTTP server on the same host.
 const qTypeA uint16 = 1
 
 var sinkholeIP = [4]byte{10, 10, 0, 254}
@@ -64,22 +67,20 @@ func (r *Resolver) Resolve(ctx context.Context, query []byte, srcIP string) []by
 	domain := m.questions[0].name
 	isAQuery := m.questions[0].qtype == qTypeA
 
-	// ── Priority 1: internet_paused — sinkhole ALL domains ───────────────────
-	// When the policy engine has paused internet for this device, every A query
-	// returns the block page IP so the browser shows the SafeSwitch page instead
-	// of a raw connection error or cached content loading silently.
+	// ── Priority 1: internet_paused — sinkhole ALL domains ──────────────────
 	if r.policy != nil && r.policy.InternetPausedForIP(srcIP) {
 		if isAQuery {
 			r.logger.Printf("[dns] paused sinkhole domain=%s src=%s", domain, srcIP)
 			return buildSinkholeA(query, sinkholeIP)
 		}
-		// AAAA / other record types → NXDOMAIN so IPv6 falls back to IPv4
 		return buildNXDomain(query)
 	}
 
-	// ── Priority 2: blocklist — sinkhole blocked domains ─────────────────────
+	// ── Priority 2: blocklist — global malware + per-child categories ────────
+	//
+	// 2a. Global malware/phishing blocklist — applies to every device.
 	if r.blocklist.IsBlocked(domain) {
-		r.logger.Printf("[dns] blocked domain=%s src=%s", domain, srcIP)
+		r.logger.Printf("[dns] blocked (malware) domain=%s src=%s", domain, srcIP)
 		r.sink.RecordBlock(BlockEvent{Domain: domain, SrcIP: srcIP})
 		if isAQuery {
 			return buildSinkholeA(query, sinkholeIP)
@@ -87,7 +88,22 @@ func (r *Resolver) Resolve(ctx context.Context, query []byte, srcIP string) []by
 		return buildNXDomain(query)
 	}
 
-	// ── Priority 3: forward to upstream ──────────────────────────────────────
+	// 2b. Per-child category blocking — only when the policy bundle carries
+	// a non-empty BlockedCategories list for this device's tunnel IP.
+	if r.policy != nil {
+		if cats := r.policy.BlockedCategoriesForIP(srcIP); len(cats) > 0 {
+			if r.blocklist.IsBlockedForCategories(domain, cats) {
+				r.logger.Printf("[dns] blocked (category) domain=%s src=%s cats=%v", domain, srcIP, cats)
+				r.sink.RecordBlock(BlockEvent{Domain: domain, SrcIP: srcIP})
+				if isAQuery {
+					return buildSinkholeA(query, sinkholeIP)
+				}
+				return buildNXDomain(query)
+			}
+		}
+	}
+
+	// ── Priority 3: forward to upstream ─────────────────────────────────────
 	resp, err := r.forward(ctx, query)
 	if err != nil {
 		r.logger.Printf("[dns] upstream failed domain=%s: %v", domain, err)
@@ -133,4 +149,3 @@ func (r *Resolver) forwardOnce(upstream string, query []byte, timeout time.Durat
 	}
 	return buf[:n], nil
 }
-
