@@ -276,6 +276,34 @@ func (m *Manager) sync(ctx context.Context) error {
 		}
 	}
 
+	// Remove peers that are no longer in the bundle.
+	// Reconciliation pass — keeps wg0 + tunnel_peers clean automatically
+	// when devices are deleted or unenrolled from Supabase.
+	dbRows, err := m.db.QueryContext(ctx, `SELECT public_key FROM tunnel_peers`)
+	if err != nil {
+		return fmt.Errorf("query peers for reconcile: %w", err)
+	}
+	var toRemove []string
+	for dbRows.Next() {
+		var key string
+		if err := dbRows.Scan(&key); err != nil {
+			continue
+		}
+		if !bundleKeys[key] {
+			toRemove = append(toRemove, key)
+		}
+	}
+	dbRows.Close()
+
+	for _, key := range toRemove {
+		short := key
+		if len(key) > 8 {
+			short = key[:8] + "..."
+		}
+		m.logger.Printf("[tunnel] removing orphaned peer key=%s (not in bundle)", short)
+		_, _ = m.db.ExecContext(ctx, `DELETE FROM tunnel_peers WHERE public_key = ?`, key)
+	}
+
 	// Load all peers from DB
 	peers, err := m.loadPeers(ctx)
 	if err != nil {
