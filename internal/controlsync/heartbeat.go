@@ -35,6 +35,9 @@ type electionHeartbeat struct {
 	AgentVersion      string         `json:"agent_version"`
 	CapabilityHash    string         `json:"capability_hash"`
 	RegistrationState string         `json:"registration_state"`
+	NodeType          string         `json:"node_type"`   // home_node | lan_node | vps_relay
+	IsLANLocal        bool           `json:"is_lan_local"` // true when on home network
+	PublicEndpoint    string         `json:"public_endpoint,omitempty"` // WG endpoint for mesh
 	Connectivity      ehConnectivity `json:"connectivity"`
 	Health            ehHealth       `json:"health"`
 	Power             ehPower        `json:"power"`
@@ -247,6 +250,9 @@ func (s *Service) sendElectionHeartbeat(
 		AgentVersion:      version.Version,
 		CapabilityHash:    capabilityHash(nodeID),
 		RegistrationState: registrationState,
+		NodeType:          s.nodeType,
+		IsLANLocal:        s.isLANLocal,
+		PublicEndpoint:    s.publicEndpoint,
 		Connectivity: ehConnectivity{
 			CloudConnected: cloudReachable,
 			LANOK:          true,
