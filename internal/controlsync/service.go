@@ -15,7 +15,7 @@ import (
 )
 
 type Logger interface {
-Printf(format string, v ...any)
+	Printf(format string, v ...any)
 }
 
 type Service struct {
@@ -28,10 +28,9 @@ type Service struct {
 	journal          *events.Journal
 	policyRuntime    *policy.Runtime
 	executor         *commands.Executor
-	// Mesh identity
-	nodeType       string // home_node | lan_node | vps_relay
-	publicEndpoint string // host or host:port advertised to the mesh
-	isLANLocal     bool
+	nodeType         string
+	publicEndpoint   string
+	isLANLocal       bool
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -78,9 +77,14 @@ func (s *Service) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
-	// Register as lan_node on first start if configured.
-	// home_node registration is handled by the existing node claiming flow.
-	// lan_node and vps_relay need to self-register via RPC.
+	// Push canonical WireGuard public key to Supabase on every startup.
+	// tunnel/manager.go writes the key to SQLite before this runs
+	// (tunnel-manager is registered earlier in the supervisor).
+	// Local canonical key file is always authority — Supabase is the reflection.
+	if err := s.syncWireguardIdentity(ctx); err != nil {
+		s.logger.Printf("[controlsync] identity sync warning: %v (continuing)", err)
+	}
+
 	if s.nodeType == "lan_node" || s.nodeType == "vps_relay" {
 		if err := s.registerNodeType(ctx); err != nil {
 			s.logger.Printf("[controlsync] node type registration warning: %v (will retry on heartbeat)", err)
@@ -96,20 +100,55 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
-// registerNodeType calls the appropriate Supabase RPC to register this node
-// in the mesh with its capabilities. Idempotent — safe to call on every restart.
+// syncWireguardIdentity reads the canonical WireGuard public key from SQLite
+// (written by tunnel/manager.go from the canonical key file) and PATCHes it
+// to Supabase. Runs on every startup. Local truth → cloud, never reverse.
+func (s *Service) syncWireguardIdentity(ctx context.Context) error {
+	pubKey := s.loadWGPublicKey(ctx)
+	if pubKey == "" {
+		s.logger.Printf("[controlsync] identity sync: no public key in SQLite yet — tunnel manager may not have started")
+		return nil
+	}
+
+	id := s.identity.Current()
+	nodeID := id.NodeID
+	if nodeID == "" {
+		s.logger.Printf("[controlsync] identity sync: no node ID yet — skipping")
+		return nil
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"wireguard_public_key": pubKey,
+		"key_verified_at":      time.Now().UTC().Format(time.RFC3339),
+		"identity_source":      "canonical_file",
+	})
+	if err != nil {
+		return err
+	}
+
+	path := "/rest/v1/nodes?id=eq." + nodeID
+	_, status, err := s.client.patchREST(ctx, path, payload)
+	if err != nil {
+		return err
+	}
+
+	s.logger.Printf("[controlsync] identity sync: pushed wg pubkey %s... to node %s (status=%d)",
+		safePrefix(pubKey), nodeID[:8]+"...", status)
+	return nil
+}
+
 func (s *Service) registerNodeType(ctx context.Context) error {
 	id := s.identity.Current()
 	familyID := s.loadFamilyID(ctx)
 	if familyID == "" {
-		return nil // not yet claimed — will retry
+		return nil
 	}
 
 	wgPubKey := s.loadWGPublicKey(ctx)
 
 	payload := map[string]any{
 		"p_family_id":          familyID,
-		"p_node_token":         "", // token already validated at claim time
+		"p_node_token":         "",
 		"p_display_name":       id.NodeName,
 		"p_os_platform":        "linux",
 		"p_wireguard_pub_key":  wgPubKey,
@@ -117,11 +156,6 @@ func (s *Service) registerNodeType(ctx context.Context) error {
 	}
 
 	rpc := "register_lan_node"
-	if s.nodeType == "vps_relay" {
-		// vps_relay uses same RPC but different node_type — handled server-side
-		// by checking the existing node record
-	}
-
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -133,31 +167,40 @@ func (s *Service) registerNodeType(ctx context.Context) error {
 	}
 	if status >= 400 {
 		s.logger.Printf("[controlsync] %s RPC status=%d", rpc, status)
-		return nil // non-fatal
+		return nil
 	}
 
 	s.logger.Printf("[controlsync] registered as %s endpoint=%s", s.nodeType, s.publicEndpoint)
 	return nil
 }
 
+// loadWGPublicKey reads the cached public key from SQLite tunnel_config.
+// Written by tunnel/manager.go reconcileIdentity() from the canonical key file.
 func (s *Service) loadWGPublicKey(ctx context.Context) string {
 	var key string
 	_ = s.db.QueryRowContext(ctx,
-		`SELECT value FROM tunnel_config WHERE key = 'public_key'`,
+		`SELECT value FROM tunnel_config WHERE key = 'wireguard_public_key'`,
 	).Scan(&key)
 	return key
 }
 
 func (s *Service) Stop(ctx context.Context) error {
-if s.cancel != nil {
-s.cancel()
-}
-s.wg.Wait()
-return nil
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.wg.Wait()
+	return nil
 }
 
 func (s *Service) Health(ctx context.Context) error { return nil }
 
 func (s *Service) EnqueueCommand(ctx context.Context, cmd contractcmds.Command) error {
-return s.executor.Enqueue(ctx, cmd)
+	return s.executor.Enqueue(ctx, cmd)
+}
+
+func safePrefix(s string) string {
+	if len(s) >= 12 {
+		return s[:12] + "..."
+	}
+	return s
 }
