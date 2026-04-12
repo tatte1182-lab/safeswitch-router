@@ -153,3 +153,4 @@ func wrapUDPFrame(deviceTag string, payload []byte) []byte {
 	copy(frame[3+len(tagBytes):], payload)
 	return frame
 }
+func (b *UDPBridge) Health(ctx context.Context) error { return nil }
