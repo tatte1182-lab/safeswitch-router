@@ -27,6 +27,7 @@ type heartbeatPayload struct {
 }
 
 type electionHeartbeat struct {
+	WireguardPublicKey string         `json:"wireguard_public_key,omitempty"`
 	SchemaVersion     int            `json:"schema_version"`
 	FamilyID          string         `json:"family_id"`
 	NodeID            string         `json:"node_id"`
@@ -252,6 +253,7 @@ func (s *Service) sendElectionHeartbeat(
 		RegistrationState: registrationState,
 		NodeType:          s.nodeType,
 		IsLANLocal:        s.isLANLocal,
+		WireguardPublicKey: s.loadWGPublicKey(ctx),
 		PublicEndpoint:    s.publicEndpoint,
 		Connectivity: ehConnectivity{
 			CloudConnected: cloudReachable,

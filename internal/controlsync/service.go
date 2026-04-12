@@ -77,13 +77,6 @@ func (s *Service) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
-	// Push canonical WireGuard public key to Supabase on every startup.
-	// Uses sync_node_wg_identity RPC via node token auth (SECURITY DEFINER).
-	// Local canonical key file is always authority — Supabase is the reflection.
-	if err := s.syncWireguardIdentity(ctx); err != nil {
-		s.logger.Printf("[controlsync] identity sync warning: %v (continuing)", err)
-	}
-
 	if s.nodeType == "lan_node" || s.nodeType == "vps_relay" {
 		if err := s.registerNodeType(ctx); err != nil {
 			s.logger.Printf("[controlsync] node type registration warning: %v (will retry on heartbeat)", err)
@@ -96,44 +89,6 @@ func (s *Service) Start(ctx context.Context) error {
 	go s.runEnforcementSync(runCtx)
 	s.logger.Printf("[controlsync] started node_type=%s lan=%v (heartbeat=%s commandPoll=%s)",
 		s.nodeType, s.isLANLocal, s.heartbeatEvery, s.commandPollEvery)
-	return nil
-}
-
-// syncWireguardIdentity pushes the canonical WireGuard public key to Supabase
-// via the sync_node_wg_identity RPC using node token auth.
-// Runs on every startup. Local truth → cloud, never reverse.
-func (s *Service) syncWireguardIdentity(ctx context.Context) error {
-	pubKey := s.loadWGPublicKey(ctx)
-	if pubKey == "" {
-		s.logger.Printf("[controlsync] identity sync: no public key in SQLite yet — tunnel manager may not have started")
-		return nil
-	}
-
-	id := s.identity.Current()
-	nodeID := id.NodeID
-	if nodeID == "" {
-		s.logger.Printf("[controlsync] identity sync: no node ID yet — skipping")
-		return nil
-	}
-
-	payload, err := json.Marshal(map[string]any{
-		"p_node_id":              nodeID,
-		"p_wireguard_public_key": pubKey,
-		"p_identity_source":      "canonical_file",
-	})
-	if err != nil {
-		return err
-	}
-
-	// post() uses nodeToken as Bearer — same auth as all edge function calls.
-	// The sync_node_wg_identity RPC is SECURITY DEFINER so it bypasses RLS.
-	_, status, err := s.client.post(ctx, "/rest/v1/rpc/sync_node_wg_identity", payload)
-	if err != nil {
-		return err
-	}
-
-	s.logger.Printf("[controlsync] identity sync: pushed wg pubkey %s... to node %s (status=%d)",
-		safePrefix(pubKey), nodeID[:8]+"...", status)
 	return nil
 }
 
@@ -174,8 +129,9 @@ func (s *Service) registerNodeType(ctx context.Context) error {
 	return nil
 }
 
-// loadWGPublicKey reads the cached public key from SQLite tunnel_config.
+// loadWGPublicKey reads the canonical public key from SQLite tunnel_config.
 // Written by tunnel/manager.go reconcileIdentity() from the canonical key file.
+// Included in every heartbeat so Supabase stays in sync automatically.
 func (s *Service) loadWGPublicKey(ctx context.Context) string {
 	var key string
 	_ = s.db.QueryRowContext(ctx,
