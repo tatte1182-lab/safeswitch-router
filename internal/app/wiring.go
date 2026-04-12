@@ -178,8 +178,17 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		if token == "" {
 			token = cfg.NodeToken
 		}
-		sup.Register(relay.NewBrokerService(cfg.RelayListenAddr, token))
+		// Create broker first so UDP bridge can reference it
+		broker := relay.NewBroker()
+		brokerSvc := relay.NewBrokerServiceWithBroker(broker, cfg.RelayListenAddr, token)
+		sup.Register(brokerSvc)
 		logger.Printf("[wiring] relay broker on %s", cfg.RelayListenAddr)
+
+		// UDP bridge — accepts WireGuard UDP on :51820 and routes via WebSocket to home node
+		udpBridge := relay.NewUDPBridge(":51820", cfg.RelayFamilyID, broker)
+		sup.Register(udpBridge)
+		logger.Printf("[wiring] relay UDP bridge on :51820")
+
 	case "home_node", "lan_node":
 		if cfg.RelayBrokerURL != "" && cfg.RelayFamilyID != "" {
 			token := cfg.RelayNodeToken

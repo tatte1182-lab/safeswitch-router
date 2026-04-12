@@ -1,7 +1,3 @@
-// Package relay implements the SafeSwitch relay broker (VPS side) and relay
-// client (home node side). The broker runs on the VPS and stitches together
-// WebSocket connections from home nodes and child devices. The client runs on
-// the home node and maintains a persistent outbound connection to the broker.
 package relay
 
 import (
@@ -12,27 +8,32 @@ import (
 )
 
 // BrokerService is a supervisor.Service that runs the relay broker on the VPS.
-// It listens on :443 (or cfg port) and accepts WebSocket connections from:
-//   - Home nodes: GET /relay/node?node_id=&family_id=&token=
-//   - Child devices: GET /relay/device?family_id=&device_id=&token=
 type BrokerService struct {
 	listenAddr string
 	nodeToken  string
+	broker     *Broker
 	server     *http.Server
 }
 
+// NewBrokerService creates a broker service with an internally managed broker.
 func NewBrokerService(listenAddr, nodeToken string) *BrokerService {
+	return NewBrokerServiceWithBroker(NewBroker(), listenAddr, nodeToken)
+}
+
+// NewBrokerServiceWithBroker creates a broker service using a pre-created broker.
+// Use this when you need to share the broker with other components (e.g. UDPBridge).
+func NewBrokerServiceWithBroker(broker *Broker, listenAddr, nodeToken string) *BrokerService {
 	return &BrokerService{
 		listenAddr: listenAddr,
 		nodeToken:  nodeToken,
+		broker:     broker,
 	}
 }
 
 func (s *BrokerService) Name() string { return "relay-broker" }
 
 func (s *BrokerService) Start(ctx context.Context) error {
-	broker := NewBroker()
-	handler := NewHandler(broker, s.nodeToken)
+	handler := NewHandler(s.broker, s.nodeToken)
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
@@ -40,7 +41,7 @@ func (s *BrokerService) Start(ctx context.Context) error {
 	s.server = &http.Server{
 		Addr:        s.listenAddr,
 		Handler:     mux,
-		ReadTimeout: 0, // WebSocket — long-lived
+		ReadTimeout: 0,
 		IdleTimeout: 120 * time.Second,
 	}
 
@@ -53,8 +54,6 @@ func (s *BrokerService) Start(ctx context.Context) error {
 
 	go func() {
 		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			// Non-fatal — log only. Port 443 may be in use by derper.
-			// In that case, set SS_ROUTER_RELAY_ADDR to a different port e.g. :8443
 			fmt.Printf("[relay-broker] listen error: %v\n", err)
 		}
 	}()

@@ -16,8 +16,8 @@ type SessionKey struct {
 // Session holds the two sides of a relay connection
 type Session struct {
 	Key       SessionKey
-	NodeConn  *Conn // home node side
-	DevConn   *Conn // child device side
+	NodeConn  *Conn
+	DevConn   *Conn
 	CreatedAt time.Time
 	mu        sync.Mutex
 }
@@ -25,7 +25,7 @@ type Session struct {
 // Conn wraps a WebSocket connection with a send channel
 type Conn struct {
 	Send   chan []byte
-	nodeID string // for node connections
+	nodeID string
 }
 
 // Broker manages all relay sessions
@@ -37,6 +37,10 @@ type Broker struct {
 
 	// pending device sessions waiting for a node
 	sessions map[SessionKey]*Session
+
+	// udpBridge for delivering UDP relay replies back to child devices
+	udpBridge *UDPBridge
+	udpMu     sync.RWMutex
 }
 
 type nodeEntry struct {
@@ -52,6 +56,13 @@ func NewBroker() *Broker {
 	}
 	go b.cleanup()
 	return b
+}
+
+// SetUDPBridge registers the UDP bridge for delivering replies to child devices.
+func (b *Broker) SetUDPBridge(bridge *UDPBridge) {
+	b.udpMu.Lock()
+	b.udpBridge = bridge
+	b.udpMu.Unlock()
 }
 
 // RegisterNode called when a home node connects via WebSocket
@@ -70,7 +81,6 @@ func (b *Broker) RegisterNode(nodeID, familyID string, conn *Conn) {
 func (b *Broker) UnregisterNode(nodeID string) {
 	b.mu.Lock()
 	delete(b.nodeConns, nodeID)
-	// Drop any sessions belonging to this node
 	for key, sess := range b.sessions {
 		if sess.NodeConn != nil && sess.NodeConn.nodeID == nodeID {
 			close(sess.NodeConn.Send)
@@ -85,12 +95,10 @@ func (b *Broker) UnregisterNode(nodeID string) {
 }
 
 // RegisterDevice called when a child device connects via WebSocket
-// Returns the session (with node conn stitched in) or error if no node available
 func (b *Broker) RegisterDevice(familyID, deviceID string, devConn *Conn) (*Session, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Find a node for this family
 	var nodeEntry *nodeEntry
 	for _, entry := range b.nodeConns {
 		if entry.FamilyID == familyID {
@@ -148,20 +156,39 @@ func (b *Broker) ForwardToNode(familyID, deviceID string, pkt []byte) {
 	}
 }
 
-// ForwardToDevice sends a packet from node → device
-// The node connection identifies which session to route to via deviceID embedded in frame header
+// ForwardToDevice sends a packet from node → device (WebSocket device sessions).
+// Also routes to UDP bridge for WireGuard UDP relay clients.
 func (b *Broker) ForwardToDevice(familyID, deviceID string, pkt []byte) {
+	// Try WebSocket device session first
 	b.mu.RLock()
 	key := SessionKey{FamilyID: familyID, DeviceID: deviceID}
 	sess, ok := b.sessions[key]
 	b.mu.RUnlock()
-	if !ok || sess.DevConn == nil {
+
+	if ok && sess.DevConn != nil {
+		select {
+		case sess.DevConn.Send <- pkt:
+		default:
+			log.Printf("[relay] device send buffer full for %s", deviceID)
+		}
 		return
 	}
-	select {
-	case sess.DevConn.Send <- pkt:
-	default:
-		log.Printf("[relay] device send buffer full, dropping packet for device %s", deviceID)
+
+	// No WebSocket session — try UDP bridge (WireGuard relay path)
+	// deviceID in this context is the client UDP addr string e.g. "1.2.3.4:12345"
+	b.udpMu.RLock()
+	bridge := b.udpBridge
+	b.udpMu.RUnlock()
+
+	if bridge != nil {
+		// Extract payload from frame (strip header)
+		if len(pkt) >= 3 {
+			devIDLen := int((uint16(pkt[1]) << 8) | uint16(pkt[2]))
+			if len(pkt) >= 3+devIDLen {
+				payload := pkt[3+devIDLen:]
+				bridge.DeliverToClient(deviceID, payload)
+			}
+		}
 	}
 }
 
