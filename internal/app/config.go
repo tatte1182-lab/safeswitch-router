@@ -38,6 +38,12 @@ type Config struct {
 	PublicEndpoint string // host or host:port advertised to peers
 	IsLANLocal     bool   // derived from NodeType
 	UPnPEnabled    bool   // auto port mapping — set SS_ROUTER_UPNP=false to disable
+	// Relay
+	RelayListenAddr string // vps_relay only: addr for relay broker e.g. ":8443"
+	RelayBrokerURL  string // home_node/lan_node: ws URL of VPS relay broker
+	RelayNodeToken  string // shared secret for relay auth
+	RelayFamilyID   string // home_node/lan_node: family this node serves
+	RelayWGAddr     string // home_node/lan_node: local wg UDP addr e.g. "127.0.0.1:51820"
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -69,6 +75,12 @@ func LoadConfigFromEnv() (Config, error) {
 		PublicEndpoint:   getenv("SS_ROUTER_PUBLIC_ENDPOINT", ""),
 		IsLANLocal:       nodeType == "lan_node",
 		UPnPEnabled:      getenv("SS_ROUTER_UPNP", "true") != "false",
+		// Relay
+		RelayListenAddr: getenv("SS_ROUTER_RELAY_ADDR", ":8443"),
+		RelayBrokerURL:  getenv("SS_ROUTER_RELAY_BROKER_URL", ""),
+		RelayNodeToken:  getenv("SS_ROUTER_RELAY_TOKEN", ""),
+		RelayFamilyID:   getenv("SS_ROUTER_RELAY_FAMILY_ID", ""),
+		RelayWGAddr:     getenv("SS_ROUTER_RELAY_WG_ADDR", "127.0.0.1:51820"),
 	}
 	if cfg.DataDir == "" { return Config{}, fmt.Errorf("data dir cannot be empty") }
 	if cfg.DBPath == ""  { return Config{}, fmt.Errorf("db path cannot be empty") }

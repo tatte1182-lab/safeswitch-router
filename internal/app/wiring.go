@@ -16,6 +16,7 @@ import (
 	"github.com/getsafeswitch/safeswitch-router/internal/identity"
 	"github.com/getsafeswitch/safeswitch-router/internal/policy"
 	"github.com/getsafeswitch/safeswitch-router/internal/presence"
+	"github.com/getsafeswitch/safeswitch-router/internal/relay"
 	"github.com/getsafeswitch/safeswitch-router/internal/sinkhole"
 	"github.com/getsafeswitch/safeswitch-router/internal/store"
 	"github.com/getsafeswitch/safeswitch-router/internal/supervisor"
@@ -168,6 +169,33 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	sup.Register(tunnelMgr)
 	sup.Register(enforcer)
 	sup.Register(controlSyncSvc)
+
+	// Relay — broker on vps_relay, client on home_node/lan_node.
+	switch cfg.NodeType {
+	case "vps_relay":
+		token := cfg.RelayNodeToken
+		if token == "" {
+			token = cfg.NodeToken
+		}
+		sup.Register(relay.NewBrokerService(cfg.RelayListenAddr, token))
+		logger.Printf("[wiring] relay broker on %s", cfg.RelayListenAddr)
+	case "home_node", "lan_node":
+		if cfg.RelayBrokerURL != "" && cfg.RelayFamilyID != "" {
+			token := cfg.RelayNodeToken
+			if token == "" {
+				token = cfg.NodeToken
+			}
+			sup.Register(relay.NewClientService(
+				cfg.RelayBrokerURL,
+				cfg.NodeName,
+				cfg.RelayFamilyID,
+				token,
+				cfg.RelayWGAddr,
+			))
+			logger.Printf("[wiring] relay client → %s", cfg.RelayBrokerURL)
+		}
+	}
+
 	sup.Register(apiSvc)
 
 	return sup, nil
