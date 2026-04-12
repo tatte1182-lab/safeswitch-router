@@ -78,8 +78,7 @@ func (s *Service) Start(ctx context.Context) error {
 	s.cancel = cancel
 
 	// Push canonical WireGuard public key to Supabase on every startup.
-	// tunnel/manager.go writes the key to SQLite before this runs
-	// (tunnel-manager is registered earlier in the supervisor).
+	// Uses sync_node_wg_identity RPC via node token auth (SECURITY DEFINER).
 	// Local canonical key file is always authority — Supabase is the reflection.
 	if err := s.syncWireguardIdentity(ctx); err != nil {
 		s.logger.Printf("[controlsync] identity sync warning: %v (continuing)", err)
@@ -100,9 +99,9 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
-// syncWireguardIdentity reads the canonical WireGuard public key from SQLite
-// (written by tunnel/manager.go from the canonical key file) and PATCHes it
-// to Supabase. Runs on every startup. Local truth → cloud, never reverse.
+// syncWireguardIdentity pushes the canonical WireGuard public key to Supabase
+// via the sync_node_wg_identity RPC using node token auth.
+// Runs on every startup. Local truth → cloud, never reverse.
 func (s *Service) syncWireguardIdentity(ctx context.Context) error {
 	pubKey := s.loadWGPublicKey(ctx)
 	if pubKey == "" {
@@ -118,16 +117,17 @@ func (s *Service) syncWireguardIdentity(ctx context.Context) error {
 	}
 
 	payload, err := json.Marshal(map[string]any{
-		"wireguard_public_key": pubKey,
-		"key_verified_at":      time.Now().UTC().Format(time.RFC3339),
-		"identity_source":      "canonical_file",
+		"p_node_id":              nodeID,
+		"p_wireguard_public_key": pubKey,
+		"p_identity_source":      "canonical_file",
 	})
 	if err != nil {
 		return err
 	}
 
-	path := "/rest/v1/nodes?id=eq." + nodeID
-	_, status, err := s.client.patchREST(ctx, path, payload)
+	// post() uses nodeToken as Bearer — same auth as all edge function calls.
+	// The sync_node_wg_identity RPC is SECURITY DEFINER so it bypasses RLS.
+	_, status, err := s.client.post(ctx, "/rest/v1/rpc/sync_node_wg_identity", payload)
 	if err != nil {
 		return err
 	}
