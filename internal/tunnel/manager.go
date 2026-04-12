@@ -456,6 +456,11 @@ func (m *Manager) reconcileIdentity(ctx context.Context, canonicalPubKey string)
 		`SELECT value FROM tunnel_config WHERE key = 'wireguard_public_key'`,
 	).Scan(&sqlitePubKey)
 
+	// Always purge private_key from SQLite — unconditional, every startup.
+	// Under the canonical file architecture, private key material must never
+	// live in SQLite. This is a hard invariant, not a conditional cleanup.
+	_, _ = m.db.ExecContext(ctx, `DELETE FROM tunnel_config WHERE key = 'private_key'`)
+
 	if sqlitePubKey != canonicalPubKey {
 		if sqlitePubKey != "" {
 			m.logger.Printf("[tunnel] identity drift: SQLite has %s..., canonical is %s... — reconciling",
@@ -464,10 +469,7 @@ func (m *Manager) reconcileIdentity(ctx context.Context, canonicalPubKey string)
 		_, _ = m.db.ExecContext(ctx,
 			`INSERT OR REPLACE INTO tunnel_config (key, value) VALUES ('wireguard_public_key', ?)`,
 			canonicalPubKey)
-		// Clear any stale private key from SQLite — it must not be used
-		_, _ = m.db.ExecContext(ctx,
-			`DELETE FROM tunnel_config WHERE key = 'private_key'`)
-		m.logger.Printf("[tunnel] identity: SQLite reconciled, stale private_key removed")
+		m.logger.Printf("[tunnel] identity: SQLite reconciled")
 	} else {
 		m.logger.Printf("[tunnel] identity: SQLite consistent ✓")
 	}
@@ -568,6 +570,17 @@ func (m *Manager) ensureSchema(ctx context.Context) error {
 			key    TEXT PRIMARY KEY,
 			value  TEXT NOT NULL
 		);`,
+		// Structural enforcement: private key material must never be stored in SQLite.
+		// Any code path that attempts to write 'private_key' will get a hard DB abort.
+		// This makes the canonical file architecture self-enforcing at the schema level.
+		`CREATE TRIGGER IF NOT EXISTS block_private_key_insert
+		 BEFORE INSERT ON tunnel_config
+		 WHEN NEW.key = 'private_key'
+		 BEGIN SELECT RAISE(ABORT, 'private_key must not be stored in SQLite — use canonical key file'); END;`,
+		`CREATE TRIGGER IF NOT EXISTS block_private_key_update
+		 BEFORE UPDATE ON tunnel_config
+		 WHEN NEW.key = 'private_key'
+		 BEGIN SELECT RAISE(ABORT, 'private_key must not be stored in SQLite — use canonical key file'); END;`,
 	}
 	for _, stmt := range stmts {
 		if _, err := m.db.ExecContext(ctx, stmt); err != nil {
