@@ -33,6 +33,8 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 
 	logger := telemetry.NewLogger(cfg.LogLevel)
 
+	isRelay := cfg.NodeType == "vps_relay"
+
 	db, err := store.Open(ctx, cfg.DBPath)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -114,31 +116,31 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		idSvc, policyRuntime, presenceEngine, controlSyncSvc, tunnelMgr,
 	)
 
-	// Load MITM CA and wire into API + proxy.
-	// Non-fatal: if the CA doesn't exist yet (fresh install, new device),
-	// the node runs without SSL inspection. CA can be provisioned later.
-	caDir := os.Getenv("SS_ROUTER_CA_DIR")
-	if caDir == "" {
-		caDir = "/root/ss-data/ca"
-	}
-	ca, err := mitm.LoadCA(
-		caDir+"/ca.crt",
-		caDir+"/ca.key",
-	)
-	if err != nil {
-		logger.Printf("[wiring] MITM CA not loaded: %v (SSL inspection disabled)", err)
-	} else {
-		apiSvc.SetCAProvider(ca)
-		mitmProxy := &mitm.Proxy{
-			CA:        ca,
-			Blocklist: blocklist,
-			Port:      8080,
+	// MITM CA + proxy — home nodes only (requires wg0 and LAN presence).
+	if !isRelay {
+		caDir := os.Getenv("SS_ROUTER_CA_DIR")
+		if caDir == "" {
+			caDir = "/root/ss-data/ca"
 		}
-		go func() {
-			if err := mitmProxy.ListenAndServe(); err != nil {
-				logger.Printf("[mitm] proxy error: %v", err)
+		ca, err := mitm.LoadCA(
+			caDir+"/ca.crt",
+			caDir+"/ca.key",
+		)
+		if err != nil {
+			logger.Printf("[wiring] MITM CA not loaded: %v (SSL inspection disabled)", err)
+		} else {
+			apiSvc.SetCAProvider(ca)
+			mitmProxy := &mitm.Proxy{
+				CA:        ca,
+				Blocklist: blocklist,
+				Port:      8080,
 			}
-		}()
+			go func() {
+				if err := mitmProxy.ListenAndServe(); err != nil {
+					logger.Printf("[mitm] proxy error: %v", err)
+				}
+			}()
+		}
 	}
 
 	sup := supervisor.New(logger)
@@ -149,25 +151,24 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	sup.Register(presenceEngine)
 	sup.Register(dnsServer)
 
-	// Bind 10.10.0.254 on wg0 so the sinkhole can listen.
-	// If the address is already bound (e.g. after a restart) the error is ignored.
-	if err := sinkhole.EnsureSinkholeAddr(); err != nil {
-		logger.Printf("[wiring] sinkhole addr: %v (continuing)", err)
-	}
-	if err := sinkhole.StartSinkhole(); err != nil {
-		return nil, fmt.Errorf("start sinkhole: %w", err)
+	// Sinkhole + UPnP + tunnel + firewall — home nodes only.
+	if !isRelay {
+		if err := sinkhole.EnsureSinkholeAddr(); err != nil {
+			logger.Printf("[wiring] sinkhole addr: %v (continuing)", err)
+		}
+		if err := sinkhole.StartSinkhole(); err != nil {
+			return nil, fmt.Errorf("start sinkhole: %w", err)
+		}
+
+		if cfg.UPnPEnabled && (cfg.NodeType == "home_node" || cfg.NodeType == "lan_node") {
+			upnpSvc := upnp.New(51820, logger)
+			sup.Register(upnpSvc)
+		}
+
+		sup.Register(tunnelMgr)
+		sup.Register(enforcer)
 	}
 
-	// UPnP — auto port mapping for WireGuard (home_node and lan_node only).
-	// Non-fatal: if the router doesn't support UPnP the service exits cleanly
-	// and the VPS relay handles WAN connectivity.
-	if cfg.UPnPEnabled && (cfg.NodeType == "home_node" || cfg.NodeType == "lan_node") {
-		upnpSvc := upnp.New(51820, logger)
-		sup.Register(upnpSvc)
-	}
-
-	sup.Register(tunnelMgr)
-	sup.Register(enforcer)
 	sup.Register(controlSyncSvc)
 
 	// Relay — broker on vps_relay, client on home_node/lan_node.
