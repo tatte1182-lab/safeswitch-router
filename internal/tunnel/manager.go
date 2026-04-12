@@ -2,11 +2,16 @@ package tunnel
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -17,37 +22,30 @@ import (
 	policybundle "github.com/getsafeswitch/safeswitch-router/pkg/contract/policybundle"
 )
 
-// Logger is the minimal logging interface the manager needs.
 type Logger interface {
 	Printf(format string, v ...any)
 }
 
-// Journal is the subset of events.Journal the manager uses.
 type Journal interface {
 	Append(ctx context.Context, evt contractevents.Event) error
 }
 
-// PolicyReader is the subset of policy.Runtime the manager needs.
 type PolicyReader interface {
 	ActiveBundle(ctx context.Context) (*policybundle.Bundle, error)
 }
 
 const (
-	// TunnelSubnet is the WireGuard tunnel address space.
-	// .1 is the router (server), .2+ are client peers.
 	TunnelSubnet      = "10.10.0.0/24"
 	TunnelGateway     = "10.10.0.1"
 	TunnelGatewayCIDR = "10.10.0.1/24"
 	DefaultListenPort = 51820
 
-	// CanonicalKeyFile is the single source of truth for the WireGuard private key.
-	// ss-router reads from here first. SQLite is only a fallback for legacy setups.
+	// CanonicalKeyFile is the ONLY source of truth for the WireGuard private key.
+	// ss-router reads from here exclusively. No other store may supply the active key.
 	CanonicalKeyFile = "/etc/safeswitch/wireguard/privatekey"
+	CanonicalKeyDir  = "/etc/safeswitch/wireguard"
 )
 
-// Manager owns the WireGuard configuration and keeps it in sync with the
-// active policy bundle. It runs a periodic sync loop and responds to
-// add_peer / remove_peer commands.
 type Manager struct {
 	db         *sql.DB
 	logger     Logger
@@ -63,8 +61,6 @@ type Manager struct {
 	wg     sync.WaitGroup
 }
 
-// NewManager constructs the tunnel manager. devMode=true skips wg CLI calls
-// so the binary runs without root or a live WireGuard interface.
 func NewManager(
 	db *sql.DB,
 	logger Logger,
@@ -89,21 +85,36 @@ func NewManager(
 func (m *Manager) Name() string { return "tunnel-manager" }
 
 func (m *Manager) Start(ctx context.Context) error {
-	// Ensure peer table exists
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
 
-	// Validate key identity on startup — detect and log drift across all stores
-	m.validateKeyIdentity(ctx)
+	// Step 1: Establish canonical identity — generate if missing, validate if present
+	privKey, created, err := m.ensureCanonicalKey()
+	if err != nil {
+		return fmt.Errorf("canonical key: %w", err)
+	}
+	if created {
+		m.logger.Printf("[tunnel] identity: canonical key created at %s", CanonicalKeyFile)
+	} else {
+		m.logger.Printf("[tunnel] identity: canonical key loaded from %s", CanonicalKeyFile)
+	}
+
+	// Step 2: Derive public key and run drift detection
+	pubKey, err := derivePublicKey(privKey)
+	if err != nil {
+		return fmt.Errorf("derive public key: %w", err)
+	}
+	m.logger.Printf("[tunnel] identity: public key = %s", pubKey[:12]+"...")
+
+	// Step 3: Reconcile all other stores outward (never inward)
+	m.reconcileIdentity(ctx, pubKey)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
 
-	// Initial sync — apply current bundle to wg0 immediately
 	if err := m.sync(ctx); err != nil {
 		m.logger.Printf("[tunnel] initial sync warning: %v", err)
-		// non-fatal — WireGuard may not be up yet on first boot
 	}
 
 	m.wg.Add(1)
@@ -123,15 +134,10 @@ func (m *Manager) Stop(ctx context.Context) error {
 
 func (m *Manager) Health(ctx context.Context) error { return nil }
 
-// TriggerSync is called by wiring.go on every policy bundle swap so that
-// new enrollments appear in wg0 immediately — without waiting for the
-// 60-second background ticker.
 func (m *Manager) TriggerSync(ctx context.Context) error {
 	return m.sync(ctx)
 }
 
-// TunnelIPForMAC returns the tunnel IP allocated to a device by MAC address.
-// Returns empty string if not found. Used by the firewall enforcer.
 func (m *Manager) TunnelIPForMAC(ctx context.Context, mac string) string {
 	var allowedIP string
 	_ = m.db.QueryRowContext(ctx,
@@ -140,7 +146,6 @@ func (m *Manager) TunnelIPForMAC(ctx context.Context, mac string) string {
 	if allowedIP == "" {
 		return ""
 	}
-	// Strip the /32 suffix — enforcer wants just the IP
 	ip, _, err := net.ParseCIDR(allowedIP)
 	if err != nil {
 		return allowedIP
@@ -148,14 +153,12 @@ func (m *Manager) TunnelIPForMAC(ctx context.Context, mac string) string {
 	return ip.String()
 }
 
-// LatestHealth returns the most recent peer health snapshot.
 func (m *Manager) LatestHealth(_ context.Context) *PeerHealthSnapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.latestHealth
 }
 
-// AddPeer adds a new WireGuard peer and persists it.
 func (m *Manager) AddPeer(ctx context.Context, publicKey, deviceMAC, comment string) (string, error) {
 	if len(publicKey) != 44 {
 		return "", fmt.Errorf("invalid WireGuard public key length %d (want 44)", len(publicKey))
@@ -193,7 +196,6 @@ func (m *Manager) AddPeer(ctx context.Context, publicKey, deviceMAC, comment str
 	return allowedIP, nil
 }
 
-// RemovePeer removes a peer by public key and resyncs.
 func (m *Manager) RemovePeer(ctx context.Context, publicKey string) error {
 	_, err := m.db.ExecContext(ctx,
 		`DELETE FROM tunnel_peers WHERE public_key = ?`, publicKey)
@@ -209,7 +211,6 @@ func (m *Manager) RemovePeer(ctx context.Context, publicKey string) error {
 	return nil
 }
 
-// runSyncLoop periodically syncs the peer list and checks tunnel health.
 func (m *Manager) runSyncLoop(ctx context.Context) {
 	defer m.wg.Done()
 
@@ -400,47 +401,12 @@ func (m *Manager) loadPeers(ctx context.Context) ([]PeerConfig, error) {
 }
 
 // loadInterfaceConfig returns the WireGuard interface config.
-//
-// Key resolution order (first non-empty wins):
-//  1. Canonical key file: /etc/safeswitch/wireguard/privatekey
-//  2. SQLite tunnel_config table (legacy / fallback)
-//
-// If both exist but differ, a drift warning is logged.
-// This enforces the architecture: one file owns the key, nothing else silently changes it.
+// The private key is loaded EXCLUSIVELY from the canonical key file.
+// SQLite is not consulted for key material — only for tunnel settings.
 func (m *Manager) loadInterfaceConfig(ctx context.Context) (InterfaceConfig, error) {
-	var fileKey, sqliteKey string
-
-	// 1. Try canonical key file
-	if data, err := os.ReadFile(CanonicalKeyFile); err == nil {
-		fileKey = strings.TrimSpace(string(data))
-	}
-
-	// 2. Try SQLite fallback
-	_ = m.db.QueryRowContext(ctx,
-		`SELECT value FROM tunnel_config WHERE key = 'private_key'`,
-	).Scan(&sqliteKey)
-
-	// Drift detection
-	if fileKey != "" && sqliteKey != "" && fileKey != sqliteKey {
-		m.logger.Printf("[tunnel] DRIFT DETECTED: key file and SQLite disagree — using key file as authority")
-		m.logger.Printf("[tunnel] drift: key_file=%s... sqlite=%s...",
-			safePrefix(fileKey), safePrefix(sqliteKey))
-		// Auto-reconcile SQLite to match the file
-		_, _ = m.db.ExecContext(ctx,
-			`INSERT OR REPLACE INTO tunnel_config (key, value) VALUES ('private_key', ?)`, fileKey)
-	}
-
-	privKey := fileKey
-	if privKey == "" {
-		privKey = sqliteKey
-		if privKey != "" {
-			m.logger.Printf("[tunnel] using SQLite key (no key file found at %s)", CanonicalKeyFile)
-		}
-	}
-
-	if privKey == "" {
-		m.logger.Printf("[tunnel] WARNING: no private key found — WireGuard will not function correctly")
-		privKey = "PLACEHOLDER_REPLACE_WITH_WG_GENKEY_OUTPUT="
+	privKey, _, err := m.ensureCanonicalKey()
+	if err != nil {
+		return InterfaceConfig{}, fmt.Errorf("canonical key unavailable: %w", err)
 	}
 
 	return InterfaceConfig{
@@ -450,33 +416,143 @@ func (m *Manager) loadInterfaceConfig(ctx context.Context) (InterfaceConfig, err
 	}, nil
 }
 
-// validateKeyIdentity checks key consistency across all stores on startup.
-func (m *Manager) validateKeyIdentity(ctx context.Context) {
-	var fileKey, sqliteKey string
+// ── Identity management ───────────────────────────────────────────────────────
 
-	if data, err := os.ReadFile(CanonicalKeyFile); err == nil {
-		fileKey = strings.TrimSpace(string(data))
-		m.logger.Printf("[tunnel] identity: key file present at %s", CanonicalKeyFile)
-	} else {
-		m.logger.Printf("[tunnel] identity: no key file at %s — will use SQLite fallback", CanonicalKeyFile)
+// ensureCanonicalKey loads the private key from the canonical file.
+// If the file doesn't exist, generates a new key and persists it.
+// Returns (key, created, error).
+func (m *Manager) ensureCanonicalKey() (string, bool, error) {
+	// Try to load existing key
+	key, err := loadCanonicalKey()
+	if err == nil {
+		return key, false, nil
 	}
 
+	// Only generate if file is genuinely missing
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", false, fmt.Errorf("read canonical key: %w — refusing to generate replacement (manual intervention required)", err)
+	}
+
+	// First boot: generate and persist
+	m.logger.Printf("[tunnel] canonical key file missing — generating new identity (first boot)")
+	key, err = generatePrivateKey()
+	if err != nil {
+		return "", false, fmt.Errorf("generate key: %w", err)
+	}
+
+	if err := persistCanonicalKey(key); err != nil {
+		return "", false, fmt.Errorf("persist canonical key: %w", err)
+	}
+
+	return key, true, nil
+}
+
+// reconcileIdentity checks all stores against the canonical public key
+// and reconciles them outward. Never mutates the local key to match a remote store.
+func (m *Manager) reconcileIdentity(ctx context.Context, canonicalPubKey string) {
+	// Check SQLite cache
+	var sqlitePubKey string
 	_ = m.db.QueryRowContext(ctx,
-		`SELECT value FROM tunnel_config WHERE key = 'private_key'`,
-	).Scan(&sqliteKey)
+		`SELECT value FROM tunnel_config WHERE key = 'wireguard_public_key'`,
+	).Scan(&sqlitePubKey)
 
-	switch {
-	case fileKey != "" && sqliteKey != "" && fileKey == sqliteKey:
-		m.logger.Printf("[tunnel] identity: key file and SQLite consistent ✓")
-	case fileKey != "" && sqliteKey != "" && fileKey != sqliteKey:
-		m.logger.Printf("[tunnel] identity: DRIFT — key file wins, reconciling SQLite")
-	case fileKey != "" && sqliteKey == "":
-		m.logger.Printf("[tunnel] identity: key file only — will write to SQLite for cache")
-	case fileKey == "" && sqliteKey != "":
-		m.logger.Printf("[tunnel] identity: SQLite only — recommend creating %s", CanonicalKeyFile)
-	default:
-		m.logger.Printf("[tunnel] identity: WARNING no key found in any store")
+	if sqlitePubKey != canonicalPubKey {
+		if sqlitePubKey != "" {
+			m.logger.Printf("[tunnel] identity drift: SQLite has %s..., canonical is %s... — reconciling",
+				safePrefix(sqlitePubKey), safePrefix(canonicalPubKey))
+		}
+		_, _ = m.db.ExecContext(ctx,
+			`INSERT OR REPLACE INTO tunnel_config (key, value) VALUES ('wireguard_public_key', ?)`,
+			canonicalPubKey)
+		// Clear any stale private key from SQLite — it must not be used
+		_, _ = m.db.ExecContext(ctx,
+			`DELETE FROM tunnel_config WHERE key = 'private_key'`)
+		m.logger.Printf("[tunnel] identity: SQLite reconciled, stale private_key removed")
+	} else {
+		m.logger.Printf("[tunnel] identity: SQLite consistent ✓")
 	}
+
+	// Check runtime wg0 if not in devMode
+	if !m.devMode {
+		out, err := exec.Command("wg", "show", wgInterface, "public-key").Output()
+		if err == nil {
+			runtimePubKey := strings.TrimSpace(string(out))
+			if runtimePubKey != "" && runtimePubKey != canonicalPubKey {
+				m.logger.Printf("[tunnel] identity drift: wg0 has %s..., canonical is %s... — will rebuild on next sync",
+					safePrefix(runtimePubKey), safePrefix(canonicalPubKey))
+			} else if runtimePubKey == canonicalPubKey {
+				m.logger.Printf("[tunnel] identity: wg0 runtime consistent ✓")
+			}
+		}
+	}
+}
+
+// ── Crypto helpers ────────────────────────────────────────────────────────────
+
+func loadCanonicalKey() (string, error) {
+	data, err := os.ReadFile(CanonicalKeyFile)
+	if err != nil {
+		return "", err
+	}
+	key := strings.TrimSpace(string(data))
+	if key == "" {
+		return "", fmt.Errorf("canonical key file is empty")
+	}
+	if len(key) != 44 {
+		return "", fmt.Errorf("canonical key has unexpected length %d (want 44 base64 chars)", len(key))
+	}
+	return key, nil
+}
+
+func persistCanonicalKey(privKey string) error {
+	if err := os.MkdirAll(CanonicalKeyDir, 0o700); err != nil {
+		return fmt.Errorf("create key dir: %w", err)
+	}
+	dir := filepath.Dir(CanonicalKeyFile)
+	tmp, err := os.CreateTemp(dir, ".privatekey-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
+	if _, err := tmp.WriteString(privKey + "\n"); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp: %w", err)
+	}
+	return os.Rename(tmpPath, CanonicalKeyFile)
+}
+
+// generatePrivateKey generates a Curve25519 WireGuard private key.
+// Uses the same method as `wg genkey`: random 32 bytes clamped per RFC 7748.
+func generatePrivateKey() (string, error) {
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return "", fmt.Errorf("read random: %w", err)
+	}
+	// Clamp per RFC 7748 §5
+	key[0] &= 248
+	key[31] &= 127
+	key[31] |= 64
+	return base64.StdEncoding.EncodeToString(key[:]), nil
+}
+
+// derivePublicKey derives the WireGuard public key from a private key using `wg pubkey`.
+func derivePublicKey(privKey string) (string, error) {
+	cmd := exec.Command("wg", "pubkey")
+	cmd.Stdin = strings.NewReader(privKey)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("wg pubkey: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func (m *Manager) ensureSchema(ctx context.Context) error {
