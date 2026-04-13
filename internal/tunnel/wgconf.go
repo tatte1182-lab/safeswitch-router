@@ -84,6 +84,7 @@ func (w *ConfWriter) EnsureInterface(iface InterfaceConfig) error {
 	exec.Command("ip", "link", "set", wgInterface, "up").Run()
 	return nil
 }
+func (w *ConfWriter) Apply(iface InterfaceConfig, peers []PeerConfig) error {
 	conf := w.buildConf(iface, peers)
 	path := wgConfPath
 	if w.devMode {
