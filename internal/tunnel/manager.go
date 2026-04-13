@@ -1,11 +1,15 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -172,14 +176,8 @@ func (m *Manager) AddPeer(ctx context.Context, publicKey, deviceMAC, comment str
 	}
 
 	allowedIP := ip + "/32"
-	now := time.Now().UTC().Format(time.RFC3339)
-
-	_, err = m.db.ExecContext(ctx, `
-		INSERT INTO tunnel_peers (public_key, allowed_ip, device_mac, comment, added_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, publicKey, allowedIP, deviceMAC, comment, now)
-	if err != nil {
-		return "", fmt.Errorf("insert peer: %w", err)
+	if err := m.upsertPeer(ctx, publicKey, allowedIP, deviceMAC, comment); err != nil {
+		return "", err
 	}
 
 	if err := m.sync(ctx); err != nil {
@@ -210,7 +208,7 @@ func (m *Manager) RemovePeer(ctx context.Context, publicKey string) error {
 func (m *Manager) runSyncLoop(ctx context.Context) {
 	defer m.wg.Done()
 
-	syncTicker   := time.NewTicker(60 * time.Second)
+	syncTicker := time.NewTicker(60 * time.Second)
 	healthTicker := time.NewTicker(30 * time.Second)
 	defer syncTicker.Stop()
 	defer healthTicker.Stop()
@@ -239,8 +237,7 @@ func (m *Manager) sync(ctx context.Context) error {
 	}
 
 	// Reconcile tunnel_peers against bundle using WireguardIP as stable identity.
-	// If a device re-enrolls with a new key, the IP stays the same but the key
-	// changes — update the key rather than accumulating stale rows.
+	// If a device re-enrolls with a new key, the IP stays the same and only the key row changes.
 	bundleKeys := make(map[string]bool)
 	for _, child := range bundle.Children {
 		if child.WireGuardPublicKey == "" || child.WireguardIP == "" {
@@ -248,10 +245,7 @@ func (m *Manager) sync(ctx context.Context) error {
 		}
 		bundleKeys[child.WireGuardPublicKey] = true
 
-		allowedIP := child.WireguardIP
-		if !strings.Contains(allowedIP, "/") {
-			allowedIP = allowedIP + "/32"
-		}
+		allowedIP := normalizeAllowedIP(child.WireguardIP)
 
 		var existingKey string
 		_ = m.db.QueryRowContext(ctx,
@@ -260,25 +254,27 @@ func (m *Manager) sync(ctx context.Context) error {
 		).Scan(&existingKey)
 
 		if existingKey == child.WireGuardPublicKey {
-			continue // already correct
+			// Keep metadata fresh without changing tunnel identity.
+			if err := m.upsertPeer(ctx, child.WireGuardPublicKey, allowedIP, child.DeviceMAC, child.ChildID); err != nil {
+				m.logger.Printf("[tunnel] refresh peer child=%s: %v", child.ChildID, err)
+			}
+			continue
 		}
 
 		if existingKey != "" {
-			// Stale key on this IP slot — evict before re-adding
-			m.logger.Printf("[tunnel] stale key on %s: replacing %s with %s",
-				allowedIP, existingKey[:8]+"...", child.WireGuardPublicKey[:8]+"...")
-			_, _ = m.db.ExecContext(ctx,
-				`DELETE FROM tunnel_peers WHERE allowed_ip = ?`, allowedIP)
+			m.logger.Printf("[tunnel] rekey on %s: updating %s -> %s",
+				allowedIP, shortKey(existingKey), shortKey(child.WireGuardPublicKey))
+		} else {
+			m.logger.Printf("[tunnel] new peer on %s: key=%s child=%s",
+				allowedIP, shortKey(child.WireGuardPublicKey), child.ChildID)
 		}
 
-		if _, err := m.AddPeer(ctx, child.WireGuardPublicKey, child.DeviceMAC, child.ChildID); err != nil {
-			m.logger.Printf("[tunnel] auto-add peer child=%s: %v", child.ChildID, err)
+		if err := m.upsertPeer(ctx, child.WireGuardPublicKey, allowedIP, child.DeviceMAC, child.ChildID); err != nil {
+			m.logger.Printf("[tunnel] auto-upsert peer child=%s: %v", child.ChildID, err)
 		}
 	}
 
 	// Remove peers that are no longer in the bundle.
-	// Reconciliation pass — keeps wg0 + tunnel_peers clean automatically
-	// when devices are deleted or unenrolled from Supabase.
 	dbRows, err := m.db.QueryContext(ctx, `SELECT public_key FROM tunnel_peers`)
 	if err != nil {
 		return fmt.Errorf("query peers for reconcile: %w", err)
@@ -296,11 +292,7 @@ func (m *Manager) sync(ctx context.Context) error {
 	dbRows.Close()
 
 	for _, key := range toRemove {
-		short := key
-		if len(key) > 8 {
-			short = key[:8] + "..."
-		}
-		m.logger.Printf("[tunnel] removing orphaned peer key=%s (not in bundle)", short)
+		m.logger.Printf("[tunnel] removing orphaned peer key=%s (not in bundle)", shortKey(key))
 		_, _ = m.db.ExecContext(ctx, `DELETE FROM tunnel_peers WHERE public_key = ?`, key)
 	}
 
@@ -397,7 +389,7 @@ func (m *Manager) allocateIP(ctx context.Context) (string, error) {
 // loadPeers reads all peers from tunnel_peers table.
 func (m *Manager) loadPeers(ctx context.Context) ([]PeerConfig, error) {
 	rows, err := m.db.QueryContext(ctx,
-		`SELECT public_key, allowed_ip, device_mac, comment FROM tunnel_peers`)
+		`SELECT public_key, allowed_ip, device_mac, comment FROM tunnel_peers ORDER BY allowed_ip ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query tunnel_peers: %w", err)
 	}
@@ -414,23 +406,163 @@ func (m *Manager) loadPeers(ctx context.Context) ([]PeerConfig, error) {
 	return peers, rows.Err()
 }
 
-// loadInterfaceConfig reads the node's WireGuard private key and builds
-// the [Interface] section.
+// loadInterfaceConfig reads the node's WireGuard private key from the canonical
+// key file first, then backfills from SQLite if needed. SQLite remains a mirror,
+// not the source of truth.
 func (m *Manager) loadInterfaceConfig(ctx context.Context) (InterfaceConfig, error) {
-	var privKey string
-	_ = m.db.QueryRowContext(ctx,
-		`SELECT value FROM tunnel_config WHERE key = 'private_key'`,
-	).Scan(&privKey)
-
-	if privKey == "" {
-		return InterfaceConfig{}, fmt.Errorf("private key not found in canonical key file")
+	privKey, source, err := m.loadCanonicalPrivateKey(ctx)
+	if err != nil {
+		return InterfaceConfig{}, err
 	}
 
+	pubKey, err := derivePublicKey(privKey)
+	if err != nil {
+		m.logger.Printf("[tunnel] warning: derive public key failed: %v", err)
+	} else {
+		if err := m.mirrorWGKeysToDB(ctx, privKey, pubKey); err != nil {
+			m.logger.Printf("[tunnel] warning: mirror wg keys to db failed: %v", err)
+		}
+	}
+
+	m.logger.Printf("[tunnel] loaded interface key from %s", source)
 	return InterfaceConfig{
 		PrivateKey: privKey,
 		ListenPort: DefaultListenPort,
 		Address:    TunnelGatewayCIDR,
 	}, nil
+}
+
+func (m *Manager) loadCanonicalPrivateKey(ctx context.Context) (string, string, error) {
+	path := canonicalWGPrivateKeyPath()
+	if raw, err := os.ReadFile(path); err == nil {
+		key := strings.TrimSpace(string(raw))
+		if err := validateWireGuardKey(key, "private"); err != nil {
+			return "", "", fmt.Errorf("invalid WireGuard private key in %s: %w", path, err)
+		}
+		return key, path, nil
+	}
+
+	var privKey string
+	_ = m.db.QueryRowContext(ctx,
+		`SELECT value FROM tunnel_config WHERE key = 'private_key'`,
+	).Scan(&privKey)
+	privKey = strings.TrimSpace(privKey)
+	if privKey == "" {
+		return "", "", fmt.Errorf("wireguard private key missing from canonical file %s and tunnel_config.private_key", path)
+	}
+	if err := validateWireGuardKey(privKey, "private"); err != nil {
+		return "", "", fmt.Errorf("invalid WireGuard private key in tunnel_config.private_key: %w", err)
+	}
+	if err := writeCanonicalPrivateKey(path, privKey); err != nil {
+		return "", "", fmt.Errorf("backfill canonical private key file %s: %w", path, err)
+	}
+	return privKey, "sqlite-backfill", nil
+}
+
+func (m *Manager) mirrorWGKeysToDB(ctx context.Context, privKey, pubKey string) error {
+	entries := map[string]string{"private_key": privKey}
+	if pubKey != "" {
+		entries["wireguard_public_key"] = pubKey
+	}
+	for key, value := range entries {
+		if _, err := m.db.ExecContext(ctx, `
+			INSERT INTO tunnel_config (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value
+		`, key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) upsertPeer(ctx context.Context, publicKey, allowedIP, deviceMAC, comment string) error {
+	if err := validateWireGuardKey(publicKey, "public"); err != nil {
+		return err
+	}
+	allowedIP = normalizeAllowedIP(allowedIP)
+	if _, _, err := net.ParseCIDR(allowedIP); err != nil {
+		return fmt.Errorf("invalid allowed_ip %q: %w", allowedIP, err)
+	}
+	_, err := m.db.ExecContext(ctx, `
+		INSERT INTO tunnel_peers (public_key, allowed_ip, device_mac, comment, added_at)
+		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(allowed_ip) DO UPDATE SET
+			public_key = excluded.public_key,
+			device_mac = excluded.device_mac,
+			comment = excluded.comment
+	`, publicKey, allowedIP, deviceMAC, comment)
+	if err != nil {
+		return fmt.Errorf("upsert peer: %w", err)
+	}
+	return nil
+}
+
+func normalizeAllowedIP(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return v
+	}
+	if !strings.Contains(v, "/") {
+		return v + "/32"
+	}
+	return v
+}
+
+func shortKey(key string) string {
+	if len(key) <= 8 {
+		return key
+	}
+	return key[:8] + "..."
+}
+
+func canonicalWGPrivateKeyPath() string {
+	if v := strings.TrimSpace(os.Getenv("SS_ROUTER_WG_PRIVATE_KEY_FILE")); v != "" {
+		return v
+	}
+	return "/etc/safeswitch/wireguard/privatekey"
+}
+
+func writeCanonicalPrivateKey(path, key string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(key+"\n"), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func derivePublicKey(privateKey string) (string, error) {
+	if strings.TrimSpace(privateKey) == "" {
+		return "", fmt.Errorf("empty private key")
+	}
+	cmd := exec.Command("wg", "pubkey")
+	cmd.Stdin = strings.NewReader(strings.TrimSpace(privateKey) + "\n")
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("wg pubkey failed: %s", msg)
+	}
+	pub := strings.TrimSpace(out.String())
+	if err := validateWireGuardKey(pub, "public"); err != nil {
+		return "", err
+	}
+	return pub, nil
+}
+
+func validateWireGuardKey(key, kind string) error {
+	key = strings.TrimSpace(key)
+	if len(key) != 44 {
+		return fmt.Errorf("invalid %s key length %d (want 44)", kind, len(key))
+	}
+	return nil
 }
 
 // ensureSchema creates the tunnel_peers and tunnel_config tables if needed.
