@@ -423,7 +423,7 @@ func (m *Manager) loadInterfaceConfig(ctx context.Context) (InterfaceConfig, err
 	).Scan(&privKey)
 
 	if privKey == "" {
-		privKey = "PLACEHOLDER_REPLACE_WITH_WG_GENKEY_OUTPUT="
+		return InterfaceConfig{}, fmt.Errorf("private key not found in canonical key file")
 	}
 
 	return InterfaceConfig{
