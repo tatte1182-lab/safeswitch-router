@@ -225,13 +225,6 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-func getenv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
 func firstNonEmpty(a, b string) string {
 	if a != "" {
 		return a
