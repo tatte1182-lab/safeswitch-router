@@ -30,6 +30,9 @@ type syncTunnelStatsPayload struct {
 // syncTunnelStats parses `wg show wg0 dump` and posts peer stats to Supabase.
 // Called once per heartbeat cycle. Errors are logged but never fatal.
 func (s *Service) syncTunnelStats(ctx context.Context) {
+	if s.nodeType == "vps_relay" {
+		return // relay nodes do not run wg0
+	}
 	peers, err := parseWGDump(ctx)
 	if err != nil {
 		s.logger.Printf("[controlsync] tunnel stats: wg dump failed: %v", err)
