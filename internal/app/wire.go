@@ -15,6 +15,7 @@ import (
 	"github.com/getsafeswitch/safeswitch-router/internal/policy"
 	"github.com/getsafeswitch/safeswitch-router/internal/store"
 	"github.com/getsafeswitch/safeswitch-router/internal/supervisor"
+	"github.com/getsafeswitch/safeswitch-router/internal/relay"
 	"github.com/getsafeswitch/safeswitch-router/internal/upnp"
 )
 
@@ -93,6 +94,12 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		upnpSvc = upnp.New(51820, logger)
 	}
 
+	// --- Relay broker (VPS only) ---
+	var relaySvc *relay.BrokerService
+	if isRelay {
+		relaySvc = relay.NewBrokerService(cfg.RelayListenAddr, cfg.RelayNodeToken)
+	}
+
 	// --- Supervisor ---
 	sup := supervisor.New(logger)
 	sup.Register(idSvc)
@@ -102,6 +109,10 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	sup.Register(controlSyncSvc)
 	if upnpSvc != nil {
 		sup.Register(upnpSvc)
+	}
+
+	if relaySvc != nil {
+		sup.Register(relaySvc)
 	}
 
 	_ = journal
