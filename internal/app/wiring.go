@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/getsafeswitch/safeswitch-router/internal/api"
@@ -27,14 +28,16 @@ import (
 )
 
 func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
+
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
 	logger := telemetry.NewLogger(cfg.LogLevel)
-
 	isRelay := cfg.NodeType == "vps_relay"
+	devMode := cfg.Environment != "prod"
 
+	// ── DB ──────────────────────────────────────────────────────────────────
 	db, err := store.Open(ctx, cfg.DBPath)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -43,33 +46,40 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
+	// ── Identity ─────────────────────────────────────────────────────────────
 	idSvc, err := identity.NewService(cfg.DataDir, cfg.NodeName, logger)
 	if err != nil {
 		return nil, fmt.Errorf("init identity: %w", err)
 	}
 
-	devMode := cfg.Environment != "prod"
-
-	journal        := events.NewJournal(db, logger)
-	policyRuntime  := policy.NewRuntime(db, logger)
-	healthSvc      := health.NewService(db, logger, cfg.HeartbeatEvery)
+	// ── Core services ────────────────────────────────────────────────────────
+	journal := events.NewJournal(db, logger)
+	policyRuntime := policy.NewRuntime(db, logger)
+	healthSvc := health.NewService(db, logger, cfg.HeartbeatEvery)
 	presenceEngine := presence.NewEngine(db, logger, journal, policyRuntime, 30*time.Second)
-
 	routeProfileStore := commands.NewDBRouteProfileStore(db)
 
+	// ── DNS ──────────────────────────────────────────────────────────────────
 	blocklist := dns.NewBlocklist()
-	resolver  := dns.NewResolver(blocklist, policyRuntime, presenceEngine, logger)
+	resolver := dns.NewResolver(blocklist, policyRuntime, presenceEngine, logger)
 	dnsServer := dns.NewServer(db, logger, resolver, blocklist, cfg.DNSListenAddr)
 
-	tunnelMgr := tunnel.NewManager(db, logger, journal, policyRuntime, devMode)
+	// ── Tunnel ───────────────────────────────────────────────────────────────
+	// WG private key file path comes from config (SS_ROUTER_WG_PRIVATE_KEY_FILE).
+	// tunnel.Manager handles fallback to SQLite backfill if the file is absent.
+	tunnelMgr := tunnel.NewManager(db, logger, journal, policyRuntime, cfg.WGPrivateKeyFile, devMode)
 
+	// ── Firewall ─────────────────────────────────────────────────────────────
 	enforcer := firewall.NewEnforcer(db, routeProfileStore, devMode, logger)
+
+	// On every policy bundle swap: sync firewall rules + trigger immediate
+	// WireGuard peer sync (so new enrollments appear without waiting 60s).
 	policyRuntime.SetOnSwap(func(ctx context.Context) {
 		if err := enforcer.SyncFromBundle(ctx); err != nil {
-			logger.Printf("[wiring] firewall sync after bundle swap: %v", err)
+			logger.Printf("[wiring] firewall sync: %v", err)
 		}
 		if err := tunnelMgr.TriggerSync(ctx); err != nil {
-			logger.Printf("[wiring] tunnel sync after bundle swap: %v", err)
+			logger.Printf("[wiring] tunnel sync: %v", err)
 		}
 	})
 
@@ -80,7 +90,6 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		}
 		children := make([]firewall.Child, 0, len(bundle.Children))
 		for _, c := range bundle.Children {
-			paused := c.LockEnabled || c.Mode == "paused"
 			routeMode := "split_tunnel"
 			if c.Mode == "full_tunnel" {
 				routeMode = "full_tunnel"
@@ -91,59 +100,74 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 				WireguardPublicKey: c.WireGuardPublicKey,
 				WireguardIP:        c.WireguardIP,
 				DisplayName:        c.ChildID,
-				Paused:             paused,
+				Paused:             c.LockEnabled || c.Mode == "paused",
 				RouteMode:          routeMode,
 			})
 		}
 		return children
 	})
 
+	// ── Commands ─────────────────────────────────────────────────────────────
 	executor := commands.NewExecutor(db, logger)
 	commands.RegisterHandlers(executor, policyRuntime, dnsServer, tunnelMgr, enforcer, routeProfileStore, logger)
 
 	controlSyncSvc := controlsync.NewService(
-		db, logger, cfg.SyncBaseURL, cfg.NodeToken, cfg.AnonKey,
-		cfg.CommandPollEvery, cfg.HeartbeatEvery,
-		idSvc, journal, policyRuntime, executor,
-		cfg.NodeType, cfg.PublicEndpoint, cfg.IsLANLocal,
+		db, logger,
+		cfg.SyncBaseURL,
+		cfg.NodeToken,
+		cfg.AnonKey,
+		cfg.CommandPollEvery,
+		cfg.HeartbeatEvery,
+		idSvc,
+		journal,
+		policyRuntime,
+		executor,
+		cfg.NodeType,
+		cfg.PublicEndpoint,
+		cfg.IsLANLocal,
 	)
 
-	// Wire DNS block events → activity_log
 	resolver.SetBlockSink(controlSyncSvc.NewActivityWriter(ctx))
 
+	// ── API ───────────────────────────────────────────────────────────────────
 	apiSvc := api.NewService(
-		cfg.HTTPListenAddr, db, logger,
-		idSvc, policyRuntime, presenceEngine, controlSyncSvc, tunnelMgr,
+		cfg.HTTPListenAddr,
+		db,
+		logger,
+		idSvc,
+		policyRuntime,
+		presenceEngine,
+		controlSyncSvc,
+		tunnelMgr,
 	)
 
-	// MITM CA + proxy — home nodes only (requires wg0 and LAN presence).
+	// ── MITM (optional — disabled gracefully if CA not present) ──────────────
 	if !isRelay {
-		caDir := os.Getenv("SS_ROUTER_CA_DIR")
-		if caDir == "" {
-			caDir = "/root/ss-data/ca"
-		}
+		caDir := getenv("SS_ROUTER_CA_DIR", filepath.Join(cfg.DataDir, "ca"))
 		ca, err := mitm.LoadCA(
-			caDir+"/ca.crt",
-			caDir+"/ca.key",
+			filepath.Join(caDir, "ca.crt"),
+			filepath.Join(caDir, "ca.key"),
 		)
 		if err != nil {
-			logger.Printf("[wiring] MITM CA not loaded: %v (SSL inspection disabled)", err)
+			logger.Printf("[wiring] MITM disabled: %v", err)
 		} else {
 			apiSvc.SetCAProvider(ca)
-			mitmProxy := &mitm.Proxy{
-				CA:        ca,
-				Blocklist: blocklist,
-				Port:      8080,
-			}
 			go func() {
-				if err := mitmProxy.ListenAndServe(); err != nil {
+				proxy := &mitm.Proxy{
+					CA:        ca,
+					Blocklist: blocklist,
+					Port:      8080,
+				}
+				if err := proxy.ListenAndServe(); err != nil {
 					logger.Printf("[mitm] proxy error: %v", err)
 				}
 			}()
 		}
 	}
 
+	// ── Supervisor ────────────────────────────────────────────────────────────
 	sup := supervisor.New(logger)
+
 	sup.Register(idSvc)
 	sup.Register(journal)
 	sup.Register(policyRuntime)
@@ -151,18 +175,16 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	sup.Register(presenceEngine)
 	sup.Register(dnsServer)
 
-	// Sinkhole + UPnP + tunnel + firewall — home nodes only.
 	if !isRelay {
 		if err := sinkhole.EnsureSinkholeAddr(); err != nil {
-			logger.Printf("[wiring] sinkhole addr: %v (continuing)", err)
+			logger.Printf("[wiring] sinkhole addr: %v", err)
 		}
 		if err := sinkhole.StartSinkhole(); err != nil {
 			return nil, fmt.Errorf("start sinkhole: %w", err)
 		}
 
 		if cfg.UPnPEnabled && (cfg.NodeType == "home_node" || cfg.NodeType == "lan_node") {
-			upnpSvc := upnp.New(51820, logger)
-			sup.Register(upnpSvc)
+			sup.Register(upnp.New(51820, logger))
 		}
 
 		sup.Register(tunnelMgr)
@@ -171,30 +193,21 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 
 	sup.Register(controlSyncSvc)
 
-	// Relay — broker on vps_relay, client on home_node/lan_node.
+	// ── Relay ──────────────────────────────────────────────────────────────────
 	switch cfg.NodeType {
-	case "vps_relay":
-		token := cfg.RelayNodeToken
-		if token == "" {
-			token = cfg.NodeToken
-		}
-		// Create broker first so UDP bridge can reference it
-		broker := relay.NewBroker()
-		brokerSvc := relay.NewBrokerServiceWithBroker(broker, cfg.RelayListenAddr, token)
-		sup.Register(brokerSvc)
-		logger.Printf("[wiring] relay broker on %s", cfg.RelayListenAddr)
 
-		// UDP bridge — accepts WireGuard UDP on :51820 and routes via WebSocket to home node
+	case "vps_relay":
+		token := firstNonEmpty(cfg.RelayNodeToken, cfg.NodeToken)
+		broker := relay.NewBroker()
+		sup.Register(relay.NewBrokerServiceWithBroker(broker, cfg.RelayListenAddr, token))
 		udpBridge := relay.NewUDPBridge(":51820", cfg.RelayFamilyID, broker)
 		sup.Register(udpBridge)
-		logger.Printf("[wiring] relay UDP bridge on :51820")
 
 	case "home_node", "lan_node":
+		// RelayBrokerURL is optional — if unset, this node connects directly
+		// (e.g. it has a public IP) and no relay client is started.
 		if cfg.RelayBrokerURL != "" && cfg.RelayFamilyID != "" {
-			token := cfg.RelayNodeToken
-			if token == "" {
-				token = cfg.NodeToken
-			}
+			token := firstNonEmpty(cfg.RelayNodeToken, cfg.NodeToken)
 			sup.Register(relay.NewClientService(
 				cfg.RelayBrokerURL,
 				cfg.NodeName,
@@ -202,11 +215,26 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 				token,
 				cfg.RelayWGAddr,
 			))
-			logger.Printf("[wiring] relay client → %s", cfg.RelayBrokerURL)
 		}
 	}
 
 	sup.Register(apiSvc)
 
 	return sup, nil
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+func getenv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }

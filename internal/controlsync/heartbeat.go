@@ -28,22 +28,22 @@ type heartbeatPayload struct {
 
 type electionHeartbeat struct {
 	WireguardPublicKey string         `json:"wireguard_public_key,omitempty"`
-	SchemaVersion     int            `json:"schema_version"`
-	FamilyID          string         `json:"family_id"`
-	NodeID            string         `json:"node_id"`
-	NodeEpoch         int64          `json:"node_epoch"`
-	SentAt            string         `json:"sent_at"`
-	AgentVersion      string         `json:"agent_version"`
-	CapabilityHash    string         `json:"capability_hash"`
-	RegistrationState string         `json:"registration_state"`
-	NodeType          string         `json:"node_type"`   // home_node | lan_node | vps_relay
-	IsLANLocal        bool           `json:"is_lan_local"` // true when on home network
-	PublicEndpoint    string         `json:"public_endpoint,omitempty"` // WG endpoint for mesh
-	Connectivity      ehConnectivity `json:"connectivity"`
-	Health            ehHealth       `json:"health"`
-	Power             ehPower        `json:"power"`
-	RoleMetrics       ehRoleMetrics  `json:"role_metrics"`
-	Observations      ehObservations `json:"observations"`
+	SchemaVersion      int            `json:"schema_version"`
+	FamilyID           string         `json:"family_id"`
+	NodeID             string         `json:"node_id"`
+	NodeEpoch          int64          `json:"node_epoch"`
+	SentAt             string         `json:"sent_at"`
+	AgentVersion       string         `json:"agent_version"`
+	CapabilityHash     string         `json:"capability_hash"`
+	RegistrationState  string         `json:"registration_state"`
+	NodeType           string         `json:"node_type"`    // home_node | lan_node | vps_relay
+	IsLANLocal         bool           `json:"is_lan_local"` // true when on home network
+	PublicEndpoint     string         `json:"public_endpoint,omitempty"`
+	Connectivity       ehConnectivity `json:"connectivity"`
+	Health             ehHealth       `json:"health"`
+	Power              ehPower        `json:"power"`
+	RoleMetrics        ehRoleMetrics  `json:"role_metrics"`
+	Observations       ehObservations `json:"observations"`
 }
 
 type ehConnectivity struct {
@@ -115,7 +115,10 @@ func (s *Service) runHeartbeat(ctx context.Context) {
 	startedAt := time.Now()
 	ticker := time.NewTicker(s.heartbeatEvery)
 	defer ticker.Stop()
+
+	// Send immediately on startup
 	s.sendHeartbeat(ctx, startedAt)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -130,15 +133,22 @@ func (s *Service) sendHeartbeat(ctx context.Context, startedAt time.Time) {
 	id := s.identity.Current()
 	cpu, mem, disk := s.latestHealth(ctx)
 	bundleVersion := "none"
+
 	if b, err := s.policyRuntime.ActiveBundle(ctx); err == nil && b != nil {
 		bundleVersion = b.Version
+
+		// FIX: ExpiresAt persistence and EmergencyDomains update are
+		// independent — one must not block or gate the other.
+		// Previously EmergencyDomains was nested inside the ExpiresAt block,
+		// so emergency domains were never updated for bundles without an expiry.
 		if !b.ExpiresAt.IsZero() {
 			s.persistBundleExpiry(ctx, b.ExpiresAt)
+		}
 		if len(b.EmergencyDomains) > 0 {
 			enforcer.UpdateEmergencyDomains(b.EmergencyDomains)
 		}
-		}
 	}
+
 	tunnelPeers := s.tunnelPeerCount(ctx)
 	deviceCount := s.deviceCount(ctx)
 	uptimeSeconds := int64(time.Since(startedAt).Seconds())
@@ -167,18 +177,20 @@ func (s *Service) sendHeartbeat(ctx context.Context, startedAt time.Time) {
 	if heartbeatErr != nil {
 		s.logger.Printf("[controlsync] heartbeat failed status=%d: %v", status, heartbeatErr)
 	} else {
-		s.logger.Printf("[controlsync] heartbeat sent node_id=%s uptime=%ds bundle=%s peers=%d devices=%d",
+		s.logger.Printf("[controlsync] heartbeat ok node_id=%s uptime=%ds bundle=%s peers=%d devices=%d",
 			id.NodeID, uptimeSeconds, bundleVersion, tunnelPeers, deviceCount)
 	}
 
+	// Failsafe: check if bundle expiry requires entering lockdown mode
 	bundleExpiresAt := s.loadBundleExpiry(ctx)
 	gracePeriod := s.loadFailsafeGrace(ctx)
 	enforcer.CheckAndEnterFailsafe(ctx, bundleExpiresAt, cloudReachable, gracePeriod)
 
+	// Election heartbeat (node role scoring)
 	s.sendElectionHeartbeat(ctx, id.NodeID, uptimeSeconds, cpu, mem, disk,
 		tunnelPeers, deviceCount, bundleVersion, cloudReachable)
 
-	// --- sync WireGuard peer stats to device_tunnel_stats ---
+	// Sync WireGuard peer stats to device_tunnel_stats
 	s.syncTunnelStats(ctx)
 
 	_ = s.journal.Append(ctx, contractevents.Event{
@@ -209,6 +221,7 @@ func (s *Service) sendElectionHeartbeat(
 
 	now := time.Now().UTC()
 
+	// Compute health score (0–100)
 	healthScore := 100
 	if cpu > 85 {
 		healthScore -= 20
@@ -243,18 +256,18 @@ func (s *Service) sendElectionHeartbeat(
 	}
 
 	hb := electionHeartbeat{
-		SchemaVersion:     1,
-		FamilyID:          familyID,
-		NodeID:            nodeID,
-		NodeEpoch:         1,
-		SentAt:            now.Format(time.RFC3339Nano),
-		AgentVersion:      version.Version,
-		CapabilityHash:    capabilityHash(nodeID),
-		RegistrationState: registrationState,
-		NodeType:          s.nodeType,
-		IsLANLocal:        s.isLANLocal,
+		SchemaVersion:      1,
+		FamilyID:           familyID,
+		NodeID:             nodeID,
+		NodeEpoch:          1,
+		SentAt:             now.Format(time.RFC3339Nano),
+		AgentVersion:       version.Version,
+		CapabilityHash:     capabilityHash(nodeID),
+		RegistrationState:  registrationState,
+		NodeType:           s.nodeType,
+		IsLANLocal:         s.isLANLocal,
 		WireguardPublicKey: s.loadWGPublicKey(ctx),
-		PublicEndpoint:    s.publicEndpoint,
+		PublicEndpoint:     s.publicEndpoint,
 		Connectivity: ehConnectivity{
 			CloudConnected: cloudReachable,
 			LANOK:          true,
@@ -325,12 +338,13 @@ func (s *Service) sendElectionHeartbeat(
 	}
 }
 
+// ── Bundle expiry / failsafe helpers ─────────────────────────────────────────
+
 func (s *Service) loadBundleExpiry(ctx context.Context) time.Time {
 	var raw string
-	err := s.db.QueryRowContext(ctx,
+	if err := s.db.QueryRowContext(ctx,
 		`SELECT value FROM tunnel_config WHERE key = 'bundle_expires_at'`,
-	).Scan(&raw)
-	if err != nil || raw == "" {
+	).Scan(&raw); err != nil || raw == "" {
 		return time.Time{}
 	}
 	t, err := time.Parse(time.RFC3339, raw)
@@ -346,16 +360,15 @@ func (s *Service) persistBundleExpiry(ctx context.Context, expiresAt time.Time) 
 		expiresAt.UTC().Format(time.RFC3339),
 	)
 	if err != nil {
-		s.logger.Printf("[controlsync] failed to persist bundle_expires_at: %v", err)
+		s.logger.Printf("[controlsync] persist bundle_expires_at: %v", err)
 	}
 }
 
 func (s *Service) loadFailsafeGrace(ctx context.Context) time.Duration {
 	var raw string
-	err := s.db.QueryRowContext(ctx,
+	if err := s.db.QueryRowContext(ctx,
 		`SELECT value FROM tunnel_config WHERE key = 'failsafe_grace_seconds'`,
-	).Scan(&raw)
-	if err != nil || raw == "" {
+	).Scan(&raw); err != nil || raw == "" {
 		return 0
 	}
 	var secs int64
@@ -371,6 +384,8 @@ func (s *Service) loadFamilyID(ctx context.Context) string {
 	return familyID
 }
 
+// ── Telemetry helpers ─────────────────────────────────────────────────────────
+
 func capabilityHash(nodeID string) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "nas:mains:ethernet:home_lan:v1:%s", nodeID)
@@ -383,7 +398,7 @@ func (s *Service) isDNSAlive(ctx context.Context) bool {
 		`SELECT COALESCE(dns_ok, 1) FROM health_snapshots ORDER BY id DESC LIMIT 1`,
 	).Scan(&ok)
 	if err != nil {
-		return true
+		return true // assume OK if no snapshot yet
 	}
 	return ok == 1
 }

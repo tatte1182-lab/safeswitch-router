@@ -1,6 +1,11 @@
 package firewall
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+)
 
 type RuleSet struct {
 	IP    string
@@ -18,10 +23,46 @@ const (
 	StateFullTunnel  = "full_tunnel"
 	StateServiceOnly = "service_only"
 	StateFullAccess  = "full_access"
-	SSChain = "SAFESWITCH"
-	wgIface = "wg0"
+	SSChain          = "SAFESWITCH"
+	wgIface          = "wg0"
 )
 
+// natIface returns the upstream network interface used for FORWARD rules.
+// Must stay in sync with the same function in tunnel/wgconf.go.
+// Resolution order:
+//  1. SS_ROUTER_NAT_IFACE environment variable
+//  2. Auto-detect from `ip route show default`
+//  3. "eth0" (safe default for VPS / cloud servers)
+func natIface() string {
+	if v := strings.TrimSpace(os.Getenv("SS_ROUTER_NAT_IFACE")); v != "" {
+		return v
+	}
+	if iface := detectDefaultIface(); iface != "" {
+		return iface
+	}
+	return "eth0"
+}
+
+func detectDefaultIface() string {
+	out, err := exec.Command("ip", "route", "show", "default").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "dev" && i+1 < len(fields) {
+				candidate := fields[i+1]
+				if candidate != "lo" && !strings.HasPrefix(candidate, "wg") {
+					return candidate
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// BuildRules returns the iptables rules for a given child device IP and state.
 func BuildRules(ip, state string) RuleSet {
 	rs := RuleSet{IP: ip, State: state}
 	switch state {
@@ -31,10 +72,9 @@ func BuildRules(ip, state string) RuleSet {
 			{Args: []string{"-A", SSChain, "-d", ip, "-j", "DROP"}, Comment: fmt.Sprintf("pause: drop inbound to %s", ip)},
 		}
 	case StateFullTunnel:
-		// No interface qualifiers — FORWARD chain sees packets after routing,
-		// so -i/-o don't match as expected for forwarded tunnel traffic.
-		// ESTABLISHED/RELATED return traffic is already ACCEPTed by the
-		// EnsureForwardJump rule before SAFESWITCH is evaluated.
+		// No interface qualifiers — FORWARD chain sees packets after routing.
+		// ESTABLISHED/RELATED return traffic is ACCEPTed by EnsureForwardJump
+		// before SAFESWITCH is evaluated.
 		rs.Rules = []Rule{
 			{Args: []string{"-A", SSChain, "-s", ip, "-j", "ACCEPT"}, Comment: fmt.Sprintf("full_tunnel: accept from %s", ip)},
 			{Args: []string{"-A", SSChain, "-d", ip, "-j", "ACCEPT"}, Comment: fmt.Sprintf("full_tunnel: accept to %s", ip)},
@@ -55,39 +95,39 @@ func BuildRules(ip, state string) RuleSet {
 	return rs
 }
 
-// ChainEnsureArgs creates the SAFESWITCH chain if it doesn't exist.
-// The FORWARD jump is NOT added here — it is handled idempotently in
-// EnsureForwardJump so we never accumulate duplicate rules.
+// ChainEnsureArgs returns args to create the SAFESWITCH chain (idempotent).
 func ChainEnsureArgs() [][]string {
 	return [][]string{
 		{"-N", SSChain},
 	}
 }
 
-// EnsureForwardJump inserts the SAFESWITCH jump into FORWARD exactly once.
-// It checks first with -C (check); only inserts with -I if absent.
-// Also ensures ESTABLISHED/RELATED and wg0→eth0 ACCEPT rules exist.
+// EnsureForwardJump returns check-args for the three FORWARD base rules.
+// The enforcer calls -C first; if absent it calls InsertForwardJump.
+// The upstream interface is resolved at call-time so a restart isn't needed
+// if SS_ROUTER_NAT_IFACE changes.
 func EnsureForwardJump() [][]string {
+	iface := natIface()
 	return [][]string{
-		// conntrack: allow return traffic for all established connections
+		// Allow return traffic for established connections
 		{"-C", "FORWARD", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"},
-		// wg0 forwarding: allow all tunnel traffic out to internet
-		{"-C", "FORWARD", "-i", wgIface, "-o", "eth0", "-j", "ACCEPT"},
-		// SAFESWITCH chain jump
+		// Allow tunnel traffic to exit via the upstream interface
+		{"-C", "FORWARD", "-i", wgIface, "-o", iface, "-j", "ACCEPT"},
+		// Jump into the SAFESWITCH per-device chain
 		{"-C", "FORWARD", "-j", SSChain},
 	}
 }
 
-// InsertForwardJump returns the -I args to insert a rule that was absent.
+// InsertForwardJump converts a -C (check) arg set to a -I (insert) arg set.
 func InsertForwardJump(checkArgs []string) []string {
-	// Replace -C with -I at position 1
 	args := make([]string, len(checkArgs))
 	copy(args, checkArgs)
 	args[0] = "-I"
-	// Insert at position 1 so SAFESWITCH is first, ESTABLISHED second, etc.
+	// Insert at position 1 so SAFESWITCH is evaluated first
 	return append([]string{args[0], "FORWARD", "1"}, args[2:]...)
 }
 
+// ChainFlushArgs returns args to flush (clear) the SAFESWITCH chain.
 func ChainFlushArgs() []string {
 	return []string{"-F", SSChain}
 }
