@@ -5,3 +5,10 @@ ss-router-linux
 *.db-shm
 *.db-wal
 ss-data/
+
+app/
+controlsync/
+enrollment/
+firewall/
+tunnel/
+deploy/ss-router.service
