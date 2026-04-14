@@ -1,30 +1,17 @@
 package controlsync
 
-// enforcementsync.go
-//
-// Dedicated goroutine that polls for pending enforcement actions every 3s.
-// Calls the fetch-enforcement-sync Edge Function (same auth as heartbeat)
-// which atomically returns + acks pending enforcement_sync_log rows.
-//
-// When rows are found (pause/unpause/dns_profile/route_profile):
-//   1. Fetches the latest policy bundle immediately
-//   2. Bundle swap applies iptables rules for affected devices
-//
-// Worst-case enforcement lag: ~4 seconds (3s poll + ~1s bundle fetch)
-// Previous lag: up to 30 seconds (heartbeat-driven bundle fetch)
-//
-// Applies to ALL devices routed through this node:
-//   - Android phones (child app)
-//   - Laptops (via WireGuard full tunnel)
-//   - Sentinel desktop (when tunnelled)
-
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"time"
 )
 
-const enforcementPollEvery = 3 * time.Second
+const (
+	enforcementPollEvery = 3 * time.Second
+	enforcementTimeout   = 5 * time.Second
+	bundleCooldown       = 2 * time.Second
+)
 
 type syncRow struct {
 	ID        string         `json:"id"`
@@ -43,33 +30,47 @@ type enforcementSyncResponse struct {
 
 func (s *Service) runEnforcementSync(ctx context.Context) {
 	defer s.wg.Done()
+
 	ticker := time.NewTicker(enforcementPollEvery)
 	defer ticker.Stop()
 
 	s.logger.Printf("[enforcementsync] started poll_every=%s", enforcementPollEvery)
+
+	var lastBundleApply time.Time
+	dedupe := make(map[string]time.Time)
+	var mu sync.Mutex
 
 	for {
 		select {
 		case <-ctx.Done():
 			s.logger.Printf("[enforcementsync] stopped")
 			return
+
 		case <-ticker.C:
-			s.pollAndEnforce(ctx)
+			s.pollAndEnforce(ctx, dedupe, &mu, &lastBundleApply)
 		}
 	}
 }
 
-func (s *Service) pollAndEnforce(ctx context.Context) {
+func (s *Service) pollAndEnforce(
+	ctx context.Context,
+	dedupe map[string]time.Time,
+	mu *sync.Mutex,
+	lastBundleApply *time.Time,
+) {
+
 	id := s.identity.Current()
 	if id.NodeID == "" {
 		return
 	}
 
-	// Call fetch-enforcement-sync — uses nodeToken auth (same as heartbeat)
+	reqCtx, cancel := context.WithTimeout(ctx, enforcementTimeout)
+	defer cancel()
+
 	reqBody, _ := json.Marshal(map[string]string{"node_id": id.NodeID})
-	body, statusCode, err := s.client.post(ctx, "/functions/v1/fetch-enforcement-sync", reqBody)
+
+	body, statusCode, err := s.client.post(reqCtx, "/functions/v1/fetch-enforcement-sync", reqBody)
 	if err != nil || statusCode >= 400 {
-		// Silent on 404 — endpoint may not be deployed yet on older installs
 		return
 	}
 
@@ -83,17 +84,47 @@ func (s *Service) pollAndEnforce(ctx context.Context) {
 		return
 	}
 
-	s.logger.Printf("[enforcementsync] %d pending row(s) acked=%d — applying bundle immediately",
-		len(resp.Rows), resp.Acked)
+	// 🔒 dedupe recent actions (avoid replay storms)
+	filtered := make([]syncRow, 0, len(resp.Rows))
 
-	for _, row := range resp.Rows {
-		s.logger.Printf("[enforcementsync] processing type=%s child=%s device=%s",
-			row.SyncType, row.ChildID, row.DeviceID)
+	mu.Lock()
+	now := time.Now()
+
+	for k, t := range dedupe {
+		if now.Sub(t) > 30*time.Second {
+			delete(dedupe, k)
+		}
 	}
 
-	// Fetch latest policy bundle — this is what actually applies iptables
-	// pause/unpause rules, DNS profiles, and route modes for affected devices.
-	s.fetchBundle(ctx)
+	for _, row := range resp.Rows {
+		key := row.DedupeKey
+		if key == "" {
+			key = row.ID
+		}
 
-	s.logger.Printf("[enforcementsync] bundle applied for %d enforcement action(s)", len(resp.Rows))
+		if _, exists := dedupe[key]; exists {
+			continue
+		}
+
+		dedupe[key] = now
+		filtered = append(filtered, row)
+	}
+	mu.Unlock()
+
+	if len(filtered) == 0 {
+		return
+	}
+
+	s.logger.Printf("[enforcementsync] %d new enforcement(s) — applying bundle", len(filtered))
+
+	// 🔥 cooldown to prevent bundle thrashing
+	if time.Since(*lastBundleApply) < bundleCooldown {
+		s.logger.Printf("[enforcementsync] bundle cooldown active — skipping")
+		return
+	}
+
+	s.fetchBundle(ctx)
+	*lastBundleApply = time.Now()
+
+	s.logger.Printf("[enforcementsync] bundle applied for %d enforcement(s)", len(filtered))
 }
