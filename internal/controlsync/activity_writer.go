@@ -12,9 +12,14 @@ import (
 	"github.com/getsafeswitch/safeswitch-router/internal/dns"
 )
 
-// activityWriterBufSize is the max queued block events before oldest are
-// dropped. DNS resolution must never block on logging.
-const activityWriterBufSize = 512
+const (
+	// activityWriterBufSize is the max queued block events before oldest are
+	// dropped. DNS resolution must never block on logging.
+	activityWriterBufSize = 512
+
+	// activityFlushInterval is how often the writer batches and flushes to Supabase.
+	activityFlushInterval = 10 * time.Second
+)
 
 
 // ActivityWriter implements dns.BlockSink.

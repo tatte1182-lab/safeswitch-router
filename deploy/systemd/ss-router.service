@@ -6,20 +6,36 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/safeswitch
-ExecStart=/usr/bin/safeswitch-node
+WorkingDirectory=/root/ss-data
+
+# ── Binary ────────────────────────────────────────────────────────────────────
+ExecStart=/usr/local/bin/safeswitch-node
+
+# Ensure WireGuard key file is root-owned and 0600 before start
+ExecStartPre=/bin/sh -c 'f=/etc/safeswitch/wireguard/privatekey; [ -f "$f" ] && chown root:root "$f" && chmod 600 "$f" || true'
+
 Restart=always
 RestartSec=3
 
+# ── Core ──────────────────────────────────────────────────────────────────────
 Environment=SS_ROUTER_ENV=prod
-Environment=SS_ROUTER_DATA_DIR=/var/lib/safeswitch
-Environment=SS_ROUTER_DB_PATH=/var/lib/safeswitch/router.db
+Environment=SS_ROUTER_DATA_DIR=/root/ss-data
+Environment=SS_ROUTER_DB_PATH=/root/ss-data/router.db
 Environment=SS_ROUTER_HTTP_ADDR=127.0.0.1:8099
-Environment=SS_ROUTER_DNS_ADDR=0.0.0.0:5353
-Environment=SS_ROUTER_SYNC_BASE_URL=https://api.getsafeswitch.app
+Environment=SS_ROUTER_DNS_ADDR=0.0.0.0:53
+Environment=SS_ROUTER_SYNC_BASE_URL=https://ylrdblwosarsunhwwsog.supabase.co
 Environment=SS_ROUTER_HEARTBEAT_SEC=30
 Environment=SS_ROUTER_COMMAND_POLL_SEC=5
 Environment=SS_ROUTER_SHUTDOWN_TIMEOUT_SEC=10
+
+# ── WireGuard ─────────────────────────────────────────────────────────────────
+# Key file path — manager.go backfills this from SQLite if missing on first boot
+Environment=SS_ROUTER_WG_PRIVATE_KEY_FILE=/etc/safeswitch/wireguard/privatekey
+
+# NAT interface — Acer Swift uses wlp2s0 (WiFi) or enp1s0 (Ethernet)
+# ss-router auto-detects via `ip route show default` if this is wrong
+# Override here if auto-detect picks the wrong interface
+Environment=SS_ROUTER_NAT_IFACE=auto
 
 [Install]
 WantedBy=multi-user.target

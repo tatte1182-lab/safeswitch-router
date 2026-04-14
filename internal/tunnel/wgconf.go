@@ -17,9 +17,12 @@ const (
 )
 
 // natIface returns the upstream interface for NAT/MASQUERADE rules.
-// Resolution: SS_ROUTER_NAT_IFACE env → auto-detect from ip route → "eth0"
+// Resolution order:
+//  1. SS_ROUTER_NAT_IFACE env (if set and not "auto")
+//  2. Auto-detect from `ip route show default`
+//  3. Fall back to "eth0"
 func natIface() string {
-	if v := strings.TrimSpace(os.Getenv("SS_ROUTER_NAT_IFACE")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("SS_ROUTER_NAT_IFACE")); v != "" && v != "auto" {
 		return v
 	}
 	if iface := detectDefaultIface(); iface != "" {
