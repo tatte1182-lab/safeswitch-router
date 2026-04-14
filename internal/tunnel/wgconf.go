@@ -117,6 +117,9 @@ func (w *ConfWriter) ensureInterfaceNonDisruptive(iface InterfaceConfig) error {
 		}
 	}
 
+	// Set private key only if wg0 doesn't already have one.
+	// Setting private-key via wg resets all peers — avoid if already set.
+	if out, _ := exec.Command("wg", "show", wgInterface, "public-key").Output(); len(strings.TrimSpace(string(out))) == 0 {
 	// Set private key and listen port non-destructively (wg set, not setconf)
 	out, err := exec.Command("wg", "set", wgInterface,
 		"listen-port", fmt.Sprintf("%d", iface.ListenPort),
@@ -130,6 +133,8 @@ func (w *ConfWriter) ensureInterfaceNonDisruptive(iface InterfaceConfig) error {
 				err, err2, strings.TrimSpace(string(out)))
 		}
 	}
+
+	} // end set-private-key-if-needed
 
 	// Assign gateway address if not already present
 	existingAddrs, _ := exec.Command("ip", "addr", "show", wgInterface).Output()
