@@ -1,4 +1,4 @@
-package app
+﻿package app
 
 import (
 	"context"
@@ -37,7 +37,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	isRelay := cfg.NodeType == "vps_relay"
 	devMode := cfg.Environment != "prod"
 
-	// ── DB ──────────────────────────────────────────────────────────────────
+	// â”€â”€ DB â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	db, err := store.Open(ctx, cfg.DBPath)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -46,38 +46,38 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
-	// ── Identity ─────────────────────────────────────────────────────────────
+	// â”€â”€ Identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	idSvc, err := identity.NewService(cfg.DataDir, cfg.NodeName, logger)
 	if err != nil {
 		return nil, fmt.Errorf("init identity: %w", err)
 	}
 
-	// ── Core services ────────────────────────────────────────────────────────
+	// â”€â”€ Core services â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	journal := events.NewJournal(db, logger)
 	policyRuntime := policy.NewRuntime(db, logger)
 	healthSvc := health.NewService(db, logger, cfg.HeartbeatEvery)
 	presenceEngine := presence.NewEngine(db, logger, journal, policyRuntime, 30*time.Second)
 	routeProfileStore := commands.NewDBRouteProfileStore(db)
 
-	// ── DNS ──────────────────────────────────────────────────────────────────
+	// â”€â”€ DNS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	blocklist := dns.NewBlocklist()
 	resolver := dns.NewResolver(blocklist, policyRuntime, presenceEngine, logger)
 	dnsServer := dns.NewServer(db, logger, resolver, blocklist, cfg.DNSListenAddr)
 
-	// ── Tunnel ───────────────────────────────────────────────────────────────
+	// â”€â”€ Tunnel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	// WG private key file path comes from config (SS_ROUTER_WG_PRIVATE_KEY_FILE).
 	// tunnel.Manager handles fallback to SQLite backfill if the file is absent.
 	tunnelMgr := tunnel.NewManager(db, logger, journal, policyRuntime, cfg.WGPrivateKeyFile, devMode)
 
-	// ── Firewall ─────────────────────────────────────────────────────────────
+	// â”€â”€ Firewall â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	enforcer := firewall.NewEnforcer(db, routeProfileStore, devMode, logger)
 
-	// ── Hardening: restore iptables on boot ────────────────────────────────
+	// â”€â”€ Hardening: restore iptables on boot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	// Re-applies the SAFESWITCH chain, DNS lock, QUIC block, and per-device
 	// rules after a node reboot. Without this, enforcement is absent until
 	// the first bundle sync cycle (up to 60s window with no filtering).
 	if !isRelay {
-		if err := restoreIptablesOnBoot(db, cfg.WGInterface); err != nil {
+		if err := restoreIptablesOnBoot(db, "wg0"); err != nil {
 			logger.Printf("[wiring] iptables restore warning: %v", err)
 		}
 	}
@@ -117,7 +117,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		return children
 	})
 
-	// ── Commands ─────────────────────────────────────────────────────────────
+	// â”€â”€ Commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	executor := commands.NewExecutor(db, logger)
 	commands.RegisterHandlers(executor, policyRuntime, dnsServer, tunnelMgr, enforcer, routeProfileStore, logger)
 
@@ -139,7 +139,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 
 	resolver.SetBlockSink(controlSyncSvc.NewActivityWriter(ctx))
 
-	// ── API ───────────────────────────────────────────────────────────────────
+	// â”€â”€ API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	apiSvc := api.NewService(
 		cfg.HTTPListenAddr,
 		db,
@@ -151,7 +151,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		tunnelMgr,
 	)
 
-	// ── MITM (optional — disabled gracefully if CA not present) ──────────────
+	// â”€â”€ MITM (optional â€” disabled gracefully if CA not present) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	if !isRelay {
 		caDir := getenv("SS_ROUTER_CA_DIR", filepath.Join(cfg.DataDir, "ca"))
 		ca, err := mitm.LoadCA(
@@ -175,7 +175,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		}
 	}
 
-	// ── Supervisor ────────────────────────────────────────────────────────────
+	// â”€â”€ Supervisor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	sup := supervisor.New(logger)
 
 	sup.Register(idSvc)
@@ -203,24 +203,24 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 
 	sup.Register(controlSyncSvc)
 
-	// ── Hardening: DDNS endpoint updater ────────────────────────────────────
+	// â”€â”€ Hardening: DDNS endpoint updater â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	// Detects public IP changes every 5 minutes and updates the nodes table
 	// in Supabase so enrolled devices can pick up the new endpoint.
-	// Only runs on home_node — the VPS relay has a static IP.
+	// Only runs on home_node â€” the VPS relay has a static IP.
 	if cfg.NodeType == "home_node" || cfg.NodeType == "lan_node" {
 		nodeID := os.Getenv("SS_NODE_ID")
 		if nodeID == "" {
 			// Fall back to reading from identity service if env var not set
-			nodeID = idSvc.ID()
+			nodeID = idSvc.Current().NodeID
 		}
 		if nodeID != "" {
-			StartDDNSUpdater(ctx, nodeID, cfg.SyncBaseURL, cfg.AnonKey, cfg.PublicEndpoint, cfg.WGPort)
+			StartDDNSUpdater(ctx, nodeID, cfg.SyncBaseURL, cfg.AnonKey, cfg.PublicEndpoint, 51820)
 		} else {
-			logger.Printf("[wiring] DDNS updater skipped — node ID not available")
+			logger.Printf("[wiring] DDNS updater skipped â€” node ID not available")
 		}
 	}
 
-	// ── Relay ──────────────────────────────────────────────────────────────────
+	// â”€â”€ Relay â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	switch cfg.NodeType {
 
 	case "vps_relay":
@@ -231,7 +231,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		sup.Register(udpBridge)
 
 	case "home_node", "lan_node":
-		// RelayBrokerURL is optional — if unset, this node connects directly
+		// RelayBrokerURL is optional â€” if unset, this node connects directly
 		// (e.g. it has a public IP) and no relay client is started.
 		if cfg.RelayBrokerURL != "" && cfg.RelayFamilyID != "" {
 			token := firstNonEmpty(cfg.RelayNodeToken, cfg.NodeToken)
@@ -250,7 +250,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	return sup, nil
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func firstNonEmpty(a, b string) string {
 	if a != "" {
