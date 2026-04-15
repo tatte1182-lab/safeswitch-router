@@ -135,7 +135,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		cfg.NodeType,
 		cfg.PublicEndpoint,
 		cfg.IsLANLocal,
-	)
+	).WithTunnel(tunnelMgr) // wire tunnel so bundle swaps immediately push peers to wg0
 
 	resolver.SetBlockSink(controlSyncSvc.NewActivityWriter(ctx))
 

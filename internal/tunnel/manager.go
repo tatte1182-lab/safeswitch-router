@@ -181,6 +181,26 @@ func (m *Manager) RemovePeer(ctx context.Context, publicKey string) error {
 	return nil
 }
 
+// RemovePeersByChildID removes all tunnel peers whose comment matches the given
+// child_id. This is the authoritative cleanup path when a child is deleted —
+// it bypasses the bundle reconcile loop so stale peers are gone immediately
+// regardless of bundle fetch state.
+func (m *Manager) RemovePeersByChildID(ctx context.Context, childID string) error {
+	res, err := m.db.ExecContext(ctx,
+		`DELETE FROM tunnel_peers WHERE comment = ?`, childID)
+	if err != nil {
+		return fmt.Errorf("remove peers for child %s: %w", childID, err)
+	}
+	n, _ := res.RowsAffected()
+	m.logger.Printf("[tunnel] removed %d peers for child_id=%s", n, childID)
+	if n > 0 {
+		if err := m.sync(ctx); err != nil {
+			m.logger.Printf("[tunnel] sync after child removal: %v", err)
+		}
+	}
+	return nil
+}
+
 func (m *Manager) runSyncLoop(ctx context.Context) {
 	defer m.done.Done()
 	syncTicker := time.NewTicker(60 * time.Second)
@@ -207,6 +227,23 @@ func (m *Manager) sync(ctx context.Context) error {
 	bundle, err := m.policy.ActiveBundle(ctx)
 	if err != nil {
 		return nil // no bundle yet
+	}
+
+	// Guard: bootstrap-local bundles have no children and no real signature.
+	// Never treat an empty bootstrap as authoritative — it would wipe all peers.
+	isBootstrap := bundle.Signature == "bootstrap-local" || bundle.Version == ""
+	if isBootstrap {
+		m.logger.Printf("[tunnel] sync skipped: bundle is bootstrap-local (peers unchanged)")
+		// Still apply current SQLite state to wg0 so wg0 reflects reality on startup.
+		peers, err := m.loadPeers(ctx)
+		if err != nil {
+			return fmt.Errorf("load peers: %w", err)
+		}
+		iface, err := m.loadInterfaceConfig(ctx)
+		if err != nil {
+			return fmt.Errorf("load interface config: %w", err)
+		}
+		return m.confWriter.Apply(iface, peers)
 	}
 
 	// Reconcile tunnel_peers table against bundle
@@ -468,13 +505,12 @@ func (m *Manager) upsertPeer(ctx context.Context, publicKey, allowedIP, deviceMA
 	if _, _, err := net.ParseCIDR(allowedIP); err != nil {
 		return fmt.Errorf("invalid allowed_ip %q: %w", allowedIP, err)
 	}
+	// INSERT OR REPLACE handles conflicts on BOTH public_key (PK) and allowed_ip (UNIQUE)
+	// atomically — avoids the double-ON CONFLICT limitation in SQLite.
+	// This is safe: the only rows replaced are stale ones for this key or IP.
 	_, err := m.db.ExecContext(ctx, `
-		INSERT INTO tunnel_peers (public_key, allowed_ip, device_mac, comment, added_at)
+		INSERT OR REPLACE INTO tunnel_peers (public_key, allowed_ip, device_mac, comment, added_at)
 		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(allowed_ip) DO UPDATE SET
-			public_key = excluded.public_key,
-			device_mac = excluded.device_mac,
-			comment    = excluded.comment
 	`, publicKey, allowedIP, deviceMAC, comment)
 	if err != nil {
 		return fmt.Errorf("upsert peer: %w", err)

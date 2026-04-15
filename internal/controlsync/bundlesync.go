@@ -14,6 +14,13 @@ const (
 	bundleRetryCount   = 3
 )
 
+// TunnelSyncer is implemented by tunnel.Manager. Declared here to avoid
+// an import cycle between controlsync and tunnel packages.
+type TunnelSyncer interface {
+	TriggerSync(ctx context.Context) error
+	RemovePeersByChildID(ctx context.Context, childID string) error
+}
+
 func (s *Service) fetchBundle(ctx context.Context) {
 	id := s.identity.Current()
 	path := fmt.Sprintf("/functions/v1/node-policy-bundle?node_id=%s", id.NodeID)
@@ -43,7 +50,12 @@ func (s *Service) fetchBundle(ctx context.Context) {
 
 	var b policybundle.Bundle
 	if err := json.Unmarshal(body, &b); err != nil {
-		s.logger.Printf("[controlsync] bundle parse failed: %v", err)
+		// Log up to 512 bytes of the raw body so we can see what the Edge Function returned
+		preview := string(body)
+		if len(preview) > 512 {
+			preview = preview[:512] + "…"
+		}
+		s.logger.Printf("[controlsync] bundle parse failed: %v | body: %s", err, preview)
 		return
 	}
 
@@ -70,11 +82,19 @@ func (s *Service) fetchBundle(ctx context.Context) {
 	}
 
 	if err := s.policyRuntime.SwapBundle(ctx, &b); err != nil {
-		s.logger.Printf("[controlsync] bundle swap failed: %v", err)
+		s.logger.Printf("[controlsync] bundle swap failed version=%s children=%d: %v",
+			b.Version, len(b.Children), err)
 		return
 	}
 
 	s.logger.Printf("[controlsync] bundle updated version=%s children=%d", b.Version, len(b.Children))
+
+	// Immediately push new peer set to wg0 — don't wait for the 60s tunnel ticker.
+	if s.tunnel != nil {
+		if err := s.tunnel.TriggerSync(ctx); err != nil {
+			s.logger.Printf("[controlsync] tunnel sync after bundle swap: %v", err)
+		}
+	}
 }
 
 // ---- Bootstrap bundle (used for safe startup fallback) ----
@@ -94,3 +114,4 @@ func (b *bootstrapBundle) toBundle() *policybundle.Bundle {
 		Children:  []policybundle.ChildEffectiveState{},
 	}
 }
+// ---- Bootstrap bundle (used for safe startup fallback) ----

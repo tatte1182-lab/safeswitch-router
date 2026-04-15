@@ -31,6 +31,7 @@ type Service struct {
 	nodeType         string
 	publicEndpoint   string
 	isLANLocal       bool
+	tunnel           TunnelSyncer // set via WithTunnel after construction
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -72,6 +73,13 @@ func NewService(
 }
 
 func (s *Service) Name() string { return "control-sync" }
+
+// WithTunnel wires the tunnel manager so that bundle updates immediately
+// trigger a wg0 peer sync without waiting for the 60s tunnel ticker.
+func (s *Service) WithTunnel(t TunnelSyncer) *Service {
+	s.tunnel = t
+	return s
+}
 
 func (s *Service) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
