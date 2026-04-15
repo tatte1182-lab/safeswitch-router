@@ -51,7 +51,7 @@ func RegisterHandlers(e *Executor, policy PolicySwapper, dnsServer DNSReloader, 
 	e.Register("restart", makeRestartHandler(logger))
 }
 
-// â”€â”€ ping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── ping ─────────────────────────────────────────────────────────────────────
 
 func makePingHandler(logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -63,7 +63,7 @@ func makePingHandler(logger Logger) Handler {
 	}
 }
 
-// â”€â”€ pause_device â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── pause_device ──────────────────────────────────────────────────────────────
 
 func makePauseDeviceHandler(fw FirewallEnforcer, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -72,7 +72,7 @@ func makePauseDeviceHandler(fw FirewallEnforcer, logger Logger) Handler {
 			return nil, err
 		}
 		if fw == nil {
-			logger.Printf("[cmd:pause_device] firewall not running â€” recorded only mac=%s", mac)
+			logger.Printf("[cmd:pause_device] firewall not running — recorded only mac=%s", mac)
 			return map[string]any{"mac": mac, "paused": true, "enforced": false}, nil
 		}
 		if err := fw.PauseDevice(ctx, mac); err != nil {
@@ -90,7 +90,7 @@ func makeUnpauseDeviceHandler(fw FirewallEnforcer, logger Logger) Handler {
 			return nil, err
 		}
 		if fw == nil {
-			logger.Printf("[cmd:unpause_device] firewall not running â€” recorded only mac=%s", mac)
+			logger.Printf("[cmd:unpause_device] firewall not running — recorded only mac=%s", mac)
 			return map[string]any{"mac": mac, "paused": false, "enforced": false}, nil
 		}
 		if err := fw.UnpauseDevice(ctx, mac); err != nil {
@@ -101,7 +101,7 @@ func makeUnpauseDeviceHandler(fw FirewallEnforcer, logger Logger) Handler {
 	}
 }
 
-// â”€â”€ update_policy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── update_policy ─────────────────────────────────────────────────────────────
 
 func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -113,17 +113,22 @@ func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 		if err != nil {
 			return nil, err
 		}
-		issuedAt, err := time.Parse(time.RFC3339, issuedAtStr)
+		// parseTime accepts both RFC3339 (no sub-seconds) and RFC3339Nano (with
+		// sub-seconds). The bundlesync Edge Function sends JS toISOString() which
+		// includes milliseconds (e.g. "2026-04-15T06:25:11.561Z") — that format is
+		// valid RFC3339Nano but rejected by time.RFC3339. The SQL trigger variant
+		// omits sub-seconds and is valid for both. Try Nano first, fall back.
+		issuedAt, err := parseTime(issuedAtStr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid issued_at: %w", err)
+			return nil, fmt.Errorf("invalid issued_at %q: %w", issuedAtStr, err)
 		}
 		expiresAtStr, err := requireString(payload, "expires_at")
 		if err != nil {
 			return nil, err
 		}
-		expiresAt, err := time.Parse(time.RFC3339, expiresAtStr)
+		expiresAt, err := parseTime(expiresAtStr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid expires_at: %w", err)
+			return nil, fmt.Errorf("invalid expires_at %q: %w", expiresAtStr, err)
 		}
 		signature, _ := payload["signature"].(string)
 
@@ -164,18 +169,7 @@ func makeUpdatePolicyHandler(policy PolicySwapper, logger Logger) Handler {
 	}
 }
 
-// â”€â”€ set_route_profile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Payload: {"profile": "full_tunnel|split_tunnel|service_only", "device_mac": "aa:bb:cc:dd:ee:ff"}
-//
-// Enforcement model: A-first, B-assisted.
-//
-//  A (mandatory): persists intent to device_route_profiles, triggers firewall
-//     resync so egress rules are updated immediately regardless of client state.
-//
-//  B (best-effort): records client_applied=false so the command dispatcher can
-//     push a cooperative update to the child app on next poll. The child app
-//     reconfigures its WireGuard AllowedIPs for cleaner routing, but this is
-//     not relied upon for security.
+// ── set_route_profile ─────────────────────────────────────────────────────────
 
 func makeSetRouteProfileHandler(fw FirewallEnforcer, rps RouteProfileStore, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -201,14 +195,12 @@ func makeSetRouteProfileHandler(fw FirewallEnforcer, rps RouteProfileStore, logg
 			source = "guardian"
 		}
 
-		// Option A â€” persist intent and enforce immediately at the node.
 		enforced := false
 		if rps != nil {
 			if err := rps.SetRouteProfile(ctx, mac, profile, source); err != nil {
 				logger.Printf("[cmd:set_route_profile] store failed mac=%s: %v", mac, err)
 			} else {
 				logger.Printf("[cmd:set_route_profile] intent stored mac=%s profile=%s source=%s", mac, profile, source)
-				// Trigger immediate firewall resync so egress rules reflect new profile.
 				if fw != nil {
 					if err := fw.SyncFromBundle(ctx); err != nil {
 						logger.Printf("[cmd:set_route_profile] firewall sync warning: %v", err)
@@ -219,10 +211,6 @@ func makeSetRouteProfileHandler(fw FirewallEnforcer, rps RouteProfileStore, logg
 			}
 		}
 
-		// Option B â€” mark client_applied=false so dispatcher can push cooperative
-		// update to child app. The dispatcher will send a set_route_profile command
-		// to the device, which updates its WireGuard AllowedIPs client-side.
-		// This is best-effort only â€” enforcement does not depend on it.
 		logger.Printf("[cmd:set_route_profile] applied mac=%s profile=%s enforced=%v client_sync=pending", mac, profile, enforced)
 
 		return map[string]any{
@@ -230,17 +218,17 @@ func makeSetRouteProfileHandler(fw FirewallEnforcer, rps RouteProfileStore, logg
 			"profile":       profile,
 			"source":        source,
 			"enforced":      enforced,
-			"client_synced": false, // updated to true when child app acks cooperative update
+			"client_synced": false,
 		}, nil
 	}
 }
 
-// â”€â”€ reload_dns_profile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── reload_dns_profile ────────────────────────────────────────────────────────
 
 func makeReloadDNSProfileHandler(dns DNSReloader, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
 		if dns == nil {
-			logger.Printf("[cmd:reload_dns_profile] dns server not running â€” skipping")
+			logger.Printf("[cmd:reload_dns_profile] dns server not running — skipping")
 			return map[string]any{"reloaded": false, "reason": "dns_server_not_running"}, nil
 		}
 		if err := dns.Reload(ctx); err != nil {
@@ -251,7 +239,7 @@ func makeReloadDNSProfileHandler(dns DNSReloader, logger Logger) Handler {
 	}
 }
 
-// â”€â”€ add_peer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── add_peer ──────────────────────────────────────────────────────────────────
 
 func makeAddPeerHandler(mgr TunnelManager, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -278,7 +266,7 @@ func makeAddPeerHandler(mgr TunnelManager, logger Logger) Handler {
 	}
 }
 
-// â”€â”€ remove_peer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── remove_peer ───────────────────────────────────────────────────────────────
 
 func makeRemovePeerHandler(mgr TunnelManager, logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -297,7 +285,7 @@ func makeRemovePeerHandler(mgr TunnelManager, logger Logger) Handler {
 	}
 }
 
-// â”€â”€ restart â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── restart ───────────────────────────────────────────────────────────────────
 
 func makeRestartHandler(logger Logger) Handler {
 	return func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -310,7 +298,7 @@ func makeRestartHandler(logger Logger) Handler {
 	}
 }
 
-// â”€â”€ payload helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── payload helpers ───────────────────────────────────────────────────────────
 
 func requireString(payload map[string]any, key string) (string, error) {
 	v, ok := payload[key]
@@ -346,18 +334,35 @@ func boolVal(m map[string]any, key string) bool {
 }
 
 func stringSliceVal(m map[string]any, key string) []string {
-        v, ok := m[key]
-        if !ok || v == nil { return nil }
-        arr, ok := v.([]any)
-        if !ok { return nil }
-        out := make([]string, 0, len(arr))
-        for _, item := range arr {
-                if s, ok := item.(string); ok && s != "" { out = append(out, s) }
-        }
-        return out
+	v, ok := m[key]
+	if !ok || v == nil {
+		return nil
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		if s, ok := item.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
-// DB-backed RouteProfileStore â€” used by the firewall enforcer and wiring.
+// parseTime accepts RFC3339 with or without sub-second precision.
+// time.RFC3339 rejects milliseconds (e.g. "2026-04-15T06:25:11.561Z"),
+// so we try RFC3339Nano first and fall back to RFC3339.
+func parseTime(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, s)
+}
+
+// ── DB-backed RouteProfileStore ───────────────────────────────────────────────
+
 type DBRouteProfileStore struct {
 	db *sql.DB
 }
@@ -398,7 +403,7 @@ func (s *DBRouteProfileStore) RouteProfileForMAC(ctx context.Context, mac string
 		`SELECT route_profile FROM device_route_profiles WHERE mac = ?`, mac,
 	).Scan(&profile)
 	if profile == "" {
-		return "split_tunnel" // safe default
+		return "split_tunnel"
 	}
 	return profile
 }

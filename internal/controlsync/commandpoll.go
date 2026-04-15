@@ -127,7 +127,10 @@ func (s *Service) ackCommand(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *Service) reportResult(ctx context.Context, cmdID string, success bool, resultJSON string) {
+// reportResult PATCHes the Supabase command_ledger via the node-commands Edge
+// Function with the final status, result payload, and — critically — the error
+// text so failures are visible remotely without needing SSH access to the node.
+func (s *Service) reportResult(ctx context.Context, cmdID string, success bool, resultJSON string, errorText string) {
 
 	reqCtx, cancel := context.WithTimeout(ctx, commandAckTimeout)
 	defer cancel()
@@ -142,6 +145,7 @@ func (s *Service) reportResult(ctx context.Context, cmdID string, success bool, 
 	body, _ := json.Marshal(map[string]string{
 		"status":      status,
 		"result_json": resultJSON,
+		"error_text":  errorText,
 	})
 
 	_, httpStatus, err := s.client.patch(reqCtx, path, body)
@@ -176,15 +180,17 @@ func (s *Service) drainPending(ctx context.Context) {
 
 			s.executor.Execute(ctx, cmd)
 
-			var status, resultJSON string
+			// Read back status, result, AND error_text from local SQLite so we
+			// can forward all three to Supabase in a single PATCH.
+			var status, resultJSON, errorText string
 			_ = s.db.QueryRowContext(ctx,
-				`SELECT status, result_json FROM command_ledger WHERE id = ?`,
+				`SELECT status, result_json, error_text FROM command_ledger WHERE id = ?`,
 				cmd.ID,
-			).Scan(&status, &resultJSON)
+			).Scan(&status, &resultJSON, &errorText)
 
 			success := status == string(contractcmds.StatusDone)
 
-			s.reportResult(ctx, cmd.ID, success, resultJSON)
+			s.reportResult(ctx, cmd.ID, success, resultJSON, errorText)
 
 		}(cmd)
 	}
