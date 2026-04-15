@@ -6,8 +6,5 @@ ss-router-linux
 *.db-wal
 ss-data/
 
-controlsync/
 enrollment/
-firewall/
-tunnel/
 deploy/ss-router.service

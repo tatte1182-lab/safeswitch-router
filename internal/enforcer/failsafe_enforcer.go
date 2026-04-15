@@ -48,6 +48,32 @@ func GetFailsafeState() (active bool, domains []string) {
 	return globalFailsafe.Active, globalFailsafe.EmergencyDomains
 }
 
+// IsActive returns true when the failsafe is currently enforced.
+// DNS handlers and the bundle applier should call this before every decision.
+func IsActive() bool {
+	globalFailsafe.mu.RLock()
+	defer globalFailsafe.mu.RUnlock()
+	return globalFailsafe.Active
+}
+
+// IsDenyAll returns true when failsafe is active AND no bundle was ever
+// received. In this state the emergency domain allowlist does NOT apply —
+// all traffic should be dropped. This prevents a fresh enrollment from
+// silently passing all traffic if cloud connectivity is lost before the
+// first bundle sync.
+func IsDenyAll() bool {
+	globalFailsafe.mu.RLock()
+	defer globalFailsafe.mu.RUnlock()
+	return globalFailsafe.Active && globalFailsafe.BundleExpiredAt.IsZero()
+}
+
+// TriggerReason returns the reason string for the current or last failsafe trigger.
+func TriggerReason() string {
+	globalFailsafe.mu.RLock()
+	defer globalFailsafe.mu.RUnlock()
+	return globalFailsafe.TriggerReason
+}
+
 func UpdateEmergencyDomains(domains []string) {
 	globalFailsafe.mu.Lock()
 	defer globalFailsafe.mu.Unlock()
@@ -63,7 +89,11 @@ func CheckAndEnterFailsafe(
 	gracePeriod time.Duration,
 ) {
 	now := time.Now()
-	bundleExpired := !bundleExpiresAt.IsZero() && now.After(bundleExpiresAt.Add(gracePeriod))
+	// A zero bundleExpiresAt means no bundle has ever been received.
+	// Treat that as immediately expired — a device with no policy bundle must
+	// not pass traffic silently when the cloud is also unreachable.
+	noBundleEver := bundleExpiresAt.IsZero()
+	bundleExpired := noBundleEver || now.After(bundleExpiresAt.Add(gracePeriod))
 	shouldBeActive := bundleExpired && !cloudReachable
 
 	globalFailsafe.mu.Lock()
@@ -78,11 +108,19 @@ func CheckAndEnterFailsafe(
 			globalFailsafe.OfflineSince = now
 			offlineSince = now
 		}
-		globalFailsafe.TriggerReason = "bundle_expired_cloud_unreachable"
+		if noBundleEver {
+			globalFailsafe.TriggerReason = "no_bundle_cloud_unreachable"
+		} else {
+			globalFailsafe.TriggerReason = "bundle_expired_cloud_unreachable"
+		}
 		globalFailsafe.mu.Unlock()
 
-		log.Printf("[FAILSAFE] ENTERING fail-safe. bundle_expired=%s cloud=%v",
-			bundleExpiresAt.Format(time.RFC3339), cloudReachable)
+		if noBundleEver {
+			log.Printf("[FAILSAFE] ENTERING fail-safe. reason=no_bundle_ever cloud=%v", cloudReachable)
+		} else {
+			log.Printf("[FAILSAFE] ENTERING fail-safe. bundle_expired=%s cloud=%v",
+				bundleExpiresAt.Format(time.RFC3339), cloudReachable)
+		}
 
 		if reporter != nil {
 			go reporter(ctx, true, "bundle_expired_cloud_unreachable", bundleExpiresAt, offlineSince)
