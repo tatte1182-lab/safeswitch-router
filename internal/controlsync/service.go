@@ -91,10 +91,11 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
-	s.wg.Add(3)
+	s.wg.Add(4)
 	go s.runHeartbeat(runCtx)
 	go s.runCommandPoll(runCtx)
 	go s.runEnforcementSync(runCtx)
+	go s.runBundleFetch(runCtx)
 	s.logger.Printf("[controlsync] started node_type=%s lan=%v (heartbeat=%s commandPoll=%s)",
 		s.nodeType, s.isLANLocal, s.heartbeatEvery, s.commandPollEvery)
 	return nil

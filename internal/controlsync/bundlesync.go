@@ -115,3 +115,26 @@ func (b *bootstrapBundle) toBundle() *policybundle.Bundle {
 	}
 }
 // ---- Bootstrap bundle (used for safe startup fallback) ----
+
+// runBundleFetch polls Supabase for a fresh policy bundle every 30s.
+// This is the periodic path — enforcementsync also calls fetchBundle
+// reactively when enforcement rows arrive, but this ensures the bundle
+// is always current even when no enforcement events are queued.
+func (s *Service) runBundleFetch(ctx context.Context) {
+	defer s.wg.Done()
+
+	// Fetch immediately on start so peers load without waiting 30s.
+	s.fetchBundle(ctx)
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.fetchBundle(ctx)
+		}
+	}
+}
