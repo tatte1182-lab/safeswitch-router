@@ -32,6 +32,7 @@ type Service struct {
 	publicEndpoint   string
 	isLANLocal       bool
 	tunnel           TunnelSyncer // set via WithTunnel after construction
+	dns              DNSReloader  // set via WithDNS after construction
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -91,11 +92,12 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
-	s.wg.Add(4)
+	s.wg.Add(5)
 	go s.runHeartbeat(runCtx)
 	go s.runCommandPoll(runCtx)
 	go s.runEnforcementSync(runCtx)
 	go s.runBundleFetch(runCtx)
+	go s.runBlocklistSync(runCtx)
 	s.logger.Printf("[controlsync] started node_type=%s lan=%v (heartbeat=%s commandPoll=%s)",
 		s.nodeType, s.isLANLocal, s.heartbeatEvery, s.commandPollEvery)
 	return nil
