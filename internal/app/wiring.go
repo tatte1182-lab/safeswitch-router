@@ -1,4 +1,4 @@
-﻿package app
+package app
 
 import (
 	"context"
@@ -15,6 +15,7 @@ import (
 	"github.com/getsafeswitch/safeswitch-router/internal/firewall"
 	"github.com/getsafeswitch/safeswitch-router/internal/health"
 	"github.com/getsafeswitch/safeswitch-router/internal/identity"
+	"github.com/getsafeswitch/safeswitch-router/internal/localclock"
 	"github.com/getsafeswitch/safeswitch-router/internal/policy"
 	"github.com/getsafeswitch/safeswitch-router/internal/presence"
 	"github.com/getsafeswitch/safeswitch-router/internal/relay"
@@ -202,6 +203,14 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	}
 
 	sup.Register(controlSyncSvc)
+
+	sup.Register(localclock.New(localclock.Config{
+		SupabaseURL:      cfg.SyncBaseURL,
+		AnonKey:          cfg.AnonKey,
+		TickInterval:     1 * time.Second,
+		LookBack:         2 * time.Minute,
+		PerChildDebounce: 30 * time.Second,
+	}, logger))
 
 	// â”€â”€ Hardening: DDNS endpoint updater â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	// Detects public IP changes every 5 minutes and updates the nodes table
