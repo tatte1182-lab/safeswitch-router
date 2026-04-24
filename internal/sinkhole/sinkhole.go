@@ -18,12 +18,6 @@
 // a device. Using a device IP (e.g. 10.10.0.2) as the sinkhole address causes
 // the VPS to claim that IP as its own, breaking return routing for that device.
 //
-// HTTPS note: HTTPS requests will show a TLS error before reaching the block
-// page because the sinkhole doesn't have a cert for the blocked domain.
-// This is the same behavior as all DNS-based blockers. The correct fix for
-// HTTPS is a transparent HTTPS proxy with a root CA installed at enrollment
-// (Phase 8 compression stack). For now HTTP domains get the clean page,
-// HTTPS domains get a browser TLS error which is still a hard block.
 
 package sinkhole
 

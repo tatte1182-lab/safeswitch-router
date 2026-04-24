@@ -7,7 +7,7 @@
 // Then in your blocked-domain handler, call BuildBlockedResponse() instead
 // of returning a SERVFAIL/NXDOMAIN.
 //
-// Sinkhole IP: 10.10.0.2 — must be bound on wg0 (see sinkhole.go).
+// Sinkhole IP: 10.10.0.254 — must be bound on wg0 (see sinkhole.go).
 // TTL is kept very short (5s) so the block lifts quickly when a schedule ends.
 
 package dns
@@ -21,7 +21,7 @@ import (
 const (
 	// SinkholeIP is the address the blocked-domain A record points to.
 	// This IP must be listening on port 80 (StartSinkhole in sinkhole.go).
-	SinkholeIP = "10.10.0.2"
+	SinkholeIP = "10.10.0.254"
 
 	// blockTTL is intentionally short so cached entries expire quickly
 	// when a schedule ends and the domain becomes accessible again.
