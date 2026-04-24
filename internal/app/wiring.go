@@ -194,6 +194,10 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 			return nil, fmt.Errorf("start sinkhole: %w", err)
 		}
 
+		if err := sinkhole.StartSinkholeTLS(); err != nil {
+			logger.Printf("[wiring] sinkhole tls: %v", err)
+		}
+
 		if cfg.UPnPEnabled && (cfg.NodeType == "home_node" || cfg.NodeType == "lan_node") {
 			sup.Register(upnp.New(51820, logger))
 		}
