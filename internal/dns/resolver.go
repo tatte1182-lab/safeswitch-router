@@ -38,6 +38,7 @@ type Resolver struct {
 	logger    Logger
 	sink      BlockSink
 	upstreams []string
+        safesearch *SafeSearch
 }
 
 func NewResolver(bl *Blocklist, policy PolicyReader, presence PresenceReader, logger Logger) *Resolver {
@@ -47,7 +48,8 @@ func NewResolver(bl *Blocklist, policy PolicyReader, presence PresenceReader, lo
 		presence:  presence,
 		logger:    logger,
 		sink:      NoopBlockSink{},
-		upstreams: []string{"1.1.1.1:53", "8.8.8.8:53"},
+		upstreams:  []string{"1.1.1.1:53", "8.8.8.8:53"},
+		safesearch: NewSafeSearch(logger),
 	}
 }
 
@@ -76,7 +78,16 @@ func (r *Resolver) Resolve(ctx context.Context, query []byte, srcIP string) []by
 		return buildNXDomain(query)
 	}
 
-	// ── Priority 2: blocklist — global malware + per-child categories ────────
+	// -- Priority 1.5: SafeSearch -- rewrite search hosts to safe variants --
+	if isAQuery && r.safesearch != nil {
+		if ip, ok := r.safesearch.Lookup(domain); ok {
+			r.logger.Printf("[dns] safesearch rewrite domain=%s -> %d.%d.%d.%d src=%s",
+				domain, ip[0], ip[1], ip[2], ip[3], srcIP)
+			return buildSinkholeA(query, ip)
+		}
+	}
+
+		// ── Priority 2: blocklist — global malware + per-child categories ────────
 	//
 	// 2a. Global malware/phishing blocklist — applies to every device.
 	if r.blocklist.IsBlocked(domain) {
