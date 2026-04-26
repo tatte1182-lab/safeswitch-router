@@ -150,7 +150,8 @@ func (r *Resolver) forwardOnce(upstream string, query []byte, timeout time.Durat
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
-	if _, err := conn.Write(query); err != nil {
+	outQuery, _ := StripECS(query)
+	if _, err := conn.Write(outQuery); err != nil {
 		return nil, err
 	}
 	buf := make([]byte, 4096)
