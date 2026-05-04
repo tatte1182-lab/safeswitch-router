@@ -8,3 +8,10 @@ ss-data/
 
 enrollment/
 deploy/ss-router.service
+*.bak
+*.bak2
+*.pre-*
+*.pem
+*.crt
+*.key
+data/
