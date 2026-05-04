@@ -71,5 +71,6 @@ Within 30s you should see:
 | `fetch-enforcement-sync` 403 | Node token missing or wrong | Add `SS_ROUTER_NODE_TOKEN` to service file |
 | `confirm_node_wg_key` silent fail | Anon key missing | Add `SS_ROUTER_ANON_KEY` to service file |
 | `wg0` peers wrong after restart | Stale bundle in SQLite | Force bundlesync via Supabase `command_ledger` INSERT |
+| Phone tunnel works on WiFi but loses internet on LTE | Mobile network IPv6 route or MTU black hole | In the phone WireGuard profile use `AllowedIPs = 0.0.0.0/0` only, remove `::/0` unless the node has IPv6 NAT, set `MTU = 1280`, and set `PersistentKeepalive = 25` |
 | `status=203/EXEC` on start | Binary path wrong | Check `ExecStart` in service file matches actual binary location |
 | `status=200/CHDIR` on start | `WorkingDirectory` doesn't exist | `mkdir -p <dir>` or update service file |
