@@ -22,9 +22,10 @@ type Config struct {
 	HTTPListenAddr   string
 	DNSListenAddr    string
 	SyncBaseURL      string
-	NodeToken        string
-	AnonKey          string
-	NotifyURL        string
+	NodeToken              string
+	AnonKey                string
+	SupabaseServiceRoleKey string
+	NotifyURL              string
 	ShutdownTimeout  time.Duration
 	HeartbeatEvery   time.Duration
 	CommandPollEvery time.Duration
@@ -73,9 +74,10 @@ func LoadConfigFromEnv() (Config, error) {
 		HTTPListenAddr:   getenv("SS_ROUTER_HTTP_ADDR", "127.0.0.1:8099"),
 		DNSListenAddr:    getenv("SS_ROUTER_DNS_ADDR", "127.0.0.1:5353"),
 		SyncBaseURL:      getenv("SS_ROUTER_SYNC_BASE_URL", ""),
-		NodeToken:        getenv("SS_ROUTER_NODE_TOKEN", ""),
-		AnonKey:          getenv("SS_ROUTER_ANON_KEY", ""),
-		NotifyURL:        getenv("SS_ROUTER_NOTIFY_URL", ""),
+		NodeToken:              getenv("SS_ROUTER_NODE_TOKEN", ""),
+		AnonKey:                getenv("SS_ROUTER_ANON_KEY", ""),
+		SupabaseServiceRoleKey: getenv("SUPABASE_SERVICE_ROLE_KEY", ""),
+		NotifyURL:              getenv("SS_ROUTER_NOTIFY_URL", ""),
 
 		ShutdownTimeout:  durationFromEnv("SS_ROUTER_SHUTDOWN_TIMEOUT_SEC", 10),
 		HeartbeatEvery:   durationFromEnv("SS_ROUTER_HEARTBEAT_SEC", 30),
