@@ -32,24 +32,27 @@ const qTypeA uint16 = 1
 var sinkholeIP = [4]byte{10, 10, 0, 254}
 
 type Resolver struct {
-	blocklist *Blocklist
-	policy    PolicyReader
-	presence  PresenceReader
-	logger    Logger
-	sink      BlockSink
-	upstreams []string
-        safesearch *SafeSearch
+	blocklist    *Blocklist
+	nrdBlocklist *NRDBlocklist // newly-registered domains, separate from threat_feeds
+	policy       PolicyReader
+	presence     PresenceReader
+	logger       Logger
+	sink         BlockSink
+	upstreams    []string
 }
 
-func NewResolver(bl *Blocklist, policy PolicyReader, presence PresenceReader, logger Logger) *Resolver {
+// NewResolver constructs the DNS resolver. The nrd argument may be nil
+// when NRD support is not yet wired (early startup, tests, etc.); the
+// resolver will skip the NRD check and forward as usual.
+func NewResolver(bl *Blocklist, nrd *NRDBlocklist, policy PolicyReader, presence PresenceReader, logger Logger) *Resolver {
 	return &Resolver{
-		blocklist: bl,
-		policy:    policy,
-		presence:  presence,
-		logger:    logger,
-		sink:      NoopBlockSink{},
-		upstreams:  []string{"1.1.1.1:53", "8.8.8.8:53"},
-		safesearch: NewSafeSearch(logger),
+		blocklist:    bl,
+		nrdBlocklist: nrd,
+		policy:       policy,
+		presence:     presence,
+		logger:       logger,
+		sink:         NoopBlockSink{},
+		upstreams:    []string{"1.1.1.1:53", "8.8.8.8:53"},
 	}
 }
 
@@ -78,16 +81,7 @@ func (r *Resolver) Resolve(ctx context.Context, query []byte, srcIP string) []by
 		return buildNXDomain(query)
 	}
 
-	// -- Priority 1.5: SafeSearch -- rewrite search hosts to safe variants --
-	if isAQuery && r.safesearch != nil {
-		if ip, ok := r.safesearch.Lookup(domain); ok {
-			r.logger.Printf("[dns] safesearch rewrite domain=%s -> %d.%d.%d.%d src=%s",
-				domain, ip[0], ip[1], ip[2], ip[3], srcIP)
-			return buildSinkholeA(query, ip)
-		}
-	}
-
-		// ── Priority 2: blocklist — global malware + per-child categories ────────
+	// ── Priority 2: blocklist — global malware + NRD + per-child categories ──
 	//
 	// 2a. Global malware/phishing blocklist — applies to every device.
 	if r.blocklist.IsBlocked(domain) {
@@ -99,7 +93,19 @@ func (r *Resolver) Resolve(ctx context.Context, query []byte, srcIP string) []by
 		return buildNXDomain(query)
 	}
 
-	// 2b. Per-child category blocking — only when the policy bundle carries
+	// 2b. NRD blocklist — newly-registered domains, block-by-default.
+	// Subdomain-walking lookup catches login.<freshly-registered.com> etc.
+	// nil-guard for early startup before NRDBlocklist is wired.
+	if r.nrdBlocklist != nil && r.nrdBlocklist.IsNRD(domain) {
+		r.logger.Printf("[dns] blocked (nrd) domain=%s src=%s", domain, srcIP)
+		r.sink.RecordBlock(BlockEvent{Domain: domain, SrcIP: srcIP})
+		if isAQuery {
+			return buildSinkholeA(query, sinkholeIP)
+		}
+		return buildNXDomain(query)
+	}
+
+	// 2c. Per-child category blocking — only when the policy bundle carries
 	// a non-empty BlockedCategories list for this device's tunnel IP.
 	if r.policy != nil {
 		if cats := r.policy.BlockedCategoriesForIP(srcIP); len(cats) > 0 {
@@ -150,8 +156,7 @@ func (r *Resolver) forwardOnce(upstream string, query []byte, timeout time.Durat
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
-	outQuery, _ := StripECS(query)
-	if _, err := conn.Write(outQuery); err != nil {
+	if _, err := conn.Write(query); err != nil {
 		return nil, err
 	}
 	buf := make([]byte, 4096)

@@ -33,6 +33,7 @@ type Service struct {
 	isLANLocal       bool
 	tunnel           TunnelSyncer // set via WithTunnel after construction
 	dns              DNSReloader  // set via WithDNS after construction
+	nrd              NRDReloader  // set via WithNRD after construction
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -44,6 +45,7 @@ func NewService(
 	baseURL string,
 	nodeToken string,
 	anonKey string,
+	serviceRoleKey string,
 	commandPollEvery time.Duration,
 	heartbeatEvery time.Duration,
 	identity *identity.Service,
@@ -57,10 +59,13 @@ func NewService(
 	if nodeType == "" {
 		nodeType = "home_node"
 	}
+	if nodeType != "vps_relay" && serviceRoleKey == "" {
+		logger.Printf("[controlsync] WARN: SUPABASE_SERVICE_ROLE_KEY not set â NRD ingest disabled")
+	}
 	return &Service{
 		db:               db,
 		logger:           logger,
-		client:           newClient(baseURL, nodeToken, anonKey, logger),
+		client:           newClient(baseURL, nodeToken, anonKey, serviceRoleKey, logger),
 		commandPollEvery: commandPollEvery,
 		heartbeatEvery:   heartbeatEvery,
 		identity:         identity,
@@ -86,11 +91,9 @@ func (s *Service) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
-	if s.nodeType == "lan_node" || s.nodeType == "vps_relay" {
-		if err := s.registerNodeType(ctx); err != nil {
-			s.logger.Printf("[controlsync] node type registration warning: %v (will retry on heartbeat)", err)
-		}
-	}
+	// NRD ingest disabled 2026-05-01 — was burning daily disk IO budget.
+	// Re-enable via R2 distribution path. ensureNRDSchema + runNRDIngest skipped.
+
 
 	s.wg.Add(5)
 	go s.runHeartbeat(runCtx)
@@ -98,6 +101,7 @@ func (s *Service) Start(ctx context.Context) error {
 	go s.runEnforcementSync(runCtx)
 	go s.runBundleFetch(runCtx)
 	go s.runBlocklistSync(runCtx)
+	// runNRDIngest disabled 2026-05-01 — see comment above
 	s.logger.Printf("[controlsync] started node_type=%s lan=%v (heartbeat=%s commandPoll=%s)",
 		s.nodeType, s.isLANLocal, s.heartbeatEvery, s.commandPollEvery)
 	return nil

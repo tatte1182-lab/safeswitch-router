@@ -62,7 +62,10 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 
 	// â”€â”€ DNS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	blocklist := dns.NewBlocklist()
-	resolver := dns.NewResolver(blocklist, policyRuntime, presenceEngine, logger)
+	// NRD disabled 2026-05-01 — Postgres ingest was burning daily disk IO budget.
+	// Re-enable via R2 distribution path. Resolver accepts nil and skips NRD check.
+	var nrdBlocklist *dns.NRDBlocklist
+	resolver := dns.NewResolver(blocklist, nrdBlocklist, policyRuntime, presenceEngine, logger)
 	dnsServer := dns.NewServer(db, logger, resolver, blocklist, cfg.DNSListenAddr)
 
 	// â”€â”€ Tunnel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -86,6 +89,9 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	// On every policy bundle swap: sync firewall rules + trigger immediate
 	// WireGuard peer sync (so new enrollments appear without waiting 60s).
 	policyRuntime.SetOnSwap(func(ctx context.Context) {
+		if isRelay {
+			return
+		}
 		if err := enforcer.SyncFromBundle(ctx); err != nil {
 			logger.Printf("[wiring] firewall sync: %v", err)
 		}
@@ -127,6 +133,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		cfg.SyncBaseURL,
 		cfg.NodeToken,
 		cfg.AnonKey,
+		cfg.SupabaseServiceRoleKey,
 		cfg.CommandPollEvery,
 		cfg.HeartbeatEvery,
 		idSvc,
@@ -136,7 +143,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		cfg.NodeType,
 		cfg.PublicEndpoint,
 		cfg.IsLANLocal,
-	).WithTunnel(tunnelMgr).WithDNS(dnsServer) // wire tunnel + DNS (for blocklist sync reload)
+	).WithTunnel(tunnelMgr).WithDNS(dnsServer) // NRD wiring removed 2026-05-01
 
 	resolver.SetBlockSink(controlSyncSvc.NewActivityWriter(ctx))
 

@@ -90,7 +90,7 @@ func (s *Service) fetchBundle(ctx context.Context) {
 	s.logger.Printf("[controlsync] bundle updated version=%s children=%d", b.Version, len(b.Children))
 
 	// Immediately push new peer set to wg0 — don't wait for the 60s tunnel ticker.
-	if s.tunnel != nil {
+	if s.nodeType != "vps_relay" && s.tunnel != nil {
 		if err := s.tunnel.TriggerSync(ctx); err != nil {
 			s.logger.Printf("[controlsync] tunnel sync after bundle swap: %v", err)
 		}
@@ -114,6 +114,7 @@ func (b *bootstrapBundle) toBundle() *policybundle.Bundle {
 		Children:  []policybundle.ChildEffectiveState{},
 	}
 }
+
 // ---- Bootstrap bundle (used for safe startup fallback) ----
 
 // runBundleFetch polls Supabase for a fresh policy bundle every 30s.
