@@ -163,8 +163,8 @@ func (c *client) postRESTPrefer(ctx context.Context, path, prefer string, body [
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.anonKey)
-	req.Header.Set("apikey", c.anonKey)
+	req.Header.Set("Authorization", "Bearer "+c.serviceRoleKey)
+	req.Header.Set("apikey", c.serviceRoleKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Prefer", prefer)
