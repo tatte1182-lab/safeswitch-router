@@ -391,14 +391,14 @@ func buildConf(iface InterfaceConfig, peers []PeerConfig) string {
 	if iface.Address != "" {
 		sb.WriteString(fmt.Sprintf("Address = %s\n", iface.Address))
 	}
-	sb.WriteString(fmt.Sprintf(
-		"PostUp = iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE; iptables -A FORWARD -i %s -j ACCEPT; iptables -A FORWARD -o %s -j ACCEPT\n",
-		TunnelSubnet, upIface, wgInterface, wgInterface,
-	))
-	sb.WriteString(fmt.Sprintf(
-		"PostDown = iptables -t nat -D POSTROUTING -s %s -o %s -j MASQUERADE; iptables -D FORWARD -i %s -j ACCEPT; iptables -D FORWARD -o %s -j ACCEPT\n",
-		TunnelSubnet, upIface, wgInterface, wgInterface,
-	))
+	// NOTE: iptables rules (MASQUERADE, FORWARD ACCEPT, wg0<->wg1 bridge,
+	// DoH blocks) are NOT managed via PostUp/PostDown here. They are owned by:
+	//   - EnsureNAT() above (idempotent MASQUERADE)
+	//   - firewall package (per-child SAFESWITCH chain)
+	//   - /etc/iptables/rules.v4 via netfilter-persistent (load-bearing rules)
+	// PostUp here would re-pollute the chain non-idempotently on every wg-quick up.
+	// Discarding upIface to keep the import surface minimal.
+	_ = upIface
 	sb.WriteString("\n")
 	for _, p := range peers {
 		if p.Comment != "" {
