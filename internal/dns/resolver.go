@@ -33,7 +33,6 @@ var sinkholeIP = [4]byte{10, 10, 0, 254}
 
 type Resolver struct {
 	blocklist    *Blocklist
-	nrdBlocklist *NRDBlocklist // newly-registered domains, separate from threat_feeds
 	policy       PolicyReader
 	presence     PresenceReader
 	logger       Logger
@@ -41,18 +40,18 @@ type Resolver struct {
 	upstreams    []string
 }
 
-// NewResolver constructs the DNS resolver. The nrd argument may be nil
-// when NRD support is not yet wired (early startup, tests, etc.); the
-// resolver will skip the NRD check and forward as usual.
-func NewResolver(bl *Blocklist, nrd *NRDBlocklist, policy PolicyReader, presence PresenceReader, logger Logger) *Resolver {
+// NewResolver constructs the DNS resolver. NRD (newly-registered
+// domain) blocking is currently disabled — re-add an *NRDBlocklist
+// parameter and the corresponding ServeDNS check when the R2-based
+// distribution path is wired up.
+func NewResolver(bl *Blocklist, policy PolicyReader, presence PresenceReader, logger Logger) *Resolver {
 	return &Resolver{
-		blocklist:    bl,
-		nrdBlocklist: nrd,
-		policy:       policy,
-		presence:     presence,
-		logger:       logger,
-		sink:         NoopBlockSink{},
-		upstreams:    []string{"1.1.1.1:53", "8.8.8.8:53"},
+		blocklist: bl,
+		policy:    policy,
+		presence:  presence,
+		logger:    logger,
+		sink:      NoopBlockSink{},
+		upstreams: []string{"1.1.1.1:53", "8.8.8.8:53"},
 	}
 }
 
@@ -93,17 +92,8 @@ func (r *Resolver) Resolve(ctx context.Context, query []byte, srcIP string) []by
 		return buildNXDomain(query)
 	}
 
-	// 2b. NRD blocklist — newly-registered domains, block-by-default.
-	// Subdomain-walking lookup catches login.<freshly-registered.com> etc.
-	// nil-guard for early startup before NRDBlocklist is wired.
-	if r.nrdBlocklist != nil && r.nrdBlocklist.IsNRD(domain) {
-		r.logger.Printf("[dns] blocked (nrd) domain=%s src=%s", domain, srcIP)
-		r.sink.RecordBlock(BlockEvent{Domain: domain, SrcIP: srcIP})
-		if isAQuery {
-			return buildSinkholeA(query, sinkholeIP)
-		}
-		return buildNXDomain(query)
-	}
+        // 2b. NRD blocklist removed 2026-05-01 — re-introduce here when the
+	// R2 distribution path lands. Sequence: malware/threat → NRD → category.
 
 	// 2c. Per-child category blocking — only when the policy bundle carries
 	// a non-empty BlockedCategories list for this device's tunnel IP.

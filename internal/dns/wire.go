@@ -3,6 +3,7 @@ package dns
 import (
 "encoding/binary"
 "errors"
+"net"
 "strings"
 )
 
@@ -50,6 +51,26 @@ class: binary.BigEndian.Uint16(b[offset+2 : offset+4]),
 offset += 4
 }
 return m, nil
+}
+
+// BuildSinkholeAFromBytes returns a DNS A response pointing to SinkholeIP
+// for the given raw DNS query bytes. Used for blocked domains so the
+// browser hits the block page instead of seeing a raw NXDOMAIN /
+// connection-refused error.
+//
+// This is the byte-level equivalent of BuildBlockedResponse — same
+// answer shape, no miekg/dns parse-then-pack roundtrip. Callers on
+// the hot path (e.g. the relay terminator's plaintext handler, which
+// has raw IP+UDP+DNS bytes already) should prefer this entry point.
+//
+// TTL is 5s so the entry expires quickly when a schedule ends.
+func BuildSinkholeAFromBytes(query []byte) []byte {
+	ip := net.ParseIP(SinkholeIP).To4()
+	var sinkhole [4]byte
+	if ip != nil {
+		copy(sinkhole[:], ip)
+	}
+	return buildSinkholeA(query, sinkhole)
 }
 
 // buildSinkholeA returns a DNS A response pointing to sinkholeIP.

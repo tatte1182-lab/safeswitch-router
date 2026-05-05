@@ -60,7 +60,7 @@ func NewService(
 		nodeType = "home_node"
 	}
 	if nodeType != "vps_relay" && serviceRoleKey == "" {
-		logger.Printf("[controlsync] WARN: SUPABASE_SERVICE_ROLE_KEY not set â NRD ingest disabled")
+		logger.Printf("[controlsync] WARN: SS_ROUTER_SERVICE_ROLE_KEY not set — NRD ingest disabled")
 	}
 	return &Service{
 		db:               db,

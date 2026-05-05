@@ -22,10 +22,14 @@ type Config struct {
 	HTTPListenAddr   string
 	DNSListenAddr    string
 	SyncBaseURL      string
-	NodeToken              string
-	AnonKey                string
-	SupabaseServiceRoleKey string
-	NotifyURL              string
+	NodeToken        string
+	AnonKey          string
+	// ServiceRoleKey is Supabase's service_role JWT. Required by controlsync
+	// for endpoints that bypass RLS (NRD ingest, family config fetch on the
+	// VPS). Optional on home/lan nodes — controlsync will warn and skip the
+	// privileged paths if unset, which is the correct dev-mode behaviour.
+	ServiceRoleKey   string
+	NotifyURL        string
 	ShutdownTimeout  time.Duration
 	HeartbeatEvery   time.Duration
 	CommandPollEvery time.Duration
@@ -54,6 +58,12 @@ type Config struct {
 	RelayNodeToken  string
 	RelayFamilyID   string
 	RelayWGAddr     string // local WG endpoint for the relay bridge, e.g. 127.0.0.1:51820
+
+	// Relay fallback (vps_relay only).
+	// RelayFallbackEndpoint: local UDP addr where the in-process WireGuard
+	// terminator listens. Empty disables fallback (silent-drop, original
+	// behaviour). Recommended: "127.0.0.1:51821".
+	RelayFallbackEndpoint string
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -74,10 +84,10 @@ func LoadConfigFromEnv() (Config, error) {
 		HTTPListenAddr:   getenv("SS_ROUTER_HTTP_ADDR", "127.0.0.1:8099"),
 		DNSListenAddr:    getenv("SS_ROUTER_DNS_ADDR", "127.0.0.1:5353"),
 		SyncBaseURL:      getenv("SS_ROUTER_SYNC_BASE_URL", ""),
-		NodeToken:              getenv("SS_ROUTER_NODE_TOKEN", ""),
-		AnonKey:                getenv("SS_ROUTER_ANON_KEY", ""),
-		SupabaseServiceRoleKey: getenv("SUPABASE_SERVICE_ROLE_KEY", ""),
-		NotifyURL:              getenv("SS_ROUTER_NOTIFY_URL", ""),
+		NodeToken:        getenv("SS_ROUTER_NODE_TOKEN", ""),
+		AnonKey:          getenv("SS_ROUTER_ANON_KEY", ""),
+		ServiceRoleKey:   getenv("SS_ROUTER_SERVICE_ROLE_KEY", ""),
+		NotifyURL:        getenv("SS_ROUTER_NOTIFY_URL", ""),
 
 		ShutdownTimeout:  durationFromEnv("SS_ROUTER_SHUTDOWN_TIMEOUT_SEC", 10),
 		HeartbeatEvery:   durationFromEnv("SS_ROUTER_HEARTBEAT_SEC", 30),
@@ -100,6 +110,8 @@ func LoadConfigFromEnv() (Config, error) {
 		RelayNodeToken:  getenv("SS_ROUTER_RELAY_TOKEN", ""),
 		RelayFamilyID:   getenv("SS_ROUTER_RELAY_FAMILY_ID", ""),
 		RelayWGAddr:     getenv("SS_ROUTER_RELAY_WG_ADDR", "127.0.0.1:51820"),
+
+		RelayFallbackEndpoint: getenv("SS_ROUTER_RELAY_FALLBACK_ENDPOINT", ""),
 	}
 
 	if err := cfg.validate(); err != nil {

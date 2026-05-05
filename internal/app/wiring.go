@@ -15,7 +15,6 @@ import (
 	"github.com/getsafeswitch/safeswitch-router/internal/firewall"
 	"github.com/getsafeswitch/safeswitch-router/internal/health"
 	"github.com/getsafeswitch/safeswitch-router/internal/identity"
-	"github.com/getsafeswitch/safeswitch-router/internal/localclock"
 	"github.com/getsafeswitch/safeswitch-router/internal/policy"
 	"github.com/getsafeswitch/safeswitch-router/internal/presence"
 	"github.com/getsafeswitch/safeswitch-router/internal/relay"
@@ -23,6 +22,7 @@ import (
 	"github.com/getsafeswitch/safeswitch-router/internal/store"
 	"github.com/getsafeswitch/safeswitch-router/internal/supervisor"
 	"github.com/getsafeswitch/safeswitch-router/internal/telemetry"
+	"github.com/getsafeswitch/safeswitch-router/internal/terminator"
 	"github.com/getsafeswitch/safeswitch-router/internal/tunnel"
 	"github.com/getsafeswitch/safeswitch-router/internal/upnp"
 	"github.com/getsafeswitch/safeswitch-router/mitm"
@@ -62,10 +62,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 
 	// â”€â”€ DNS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	blocklist := dns.NewBlocklist()
-	// NRD disabled 2026-05-01 — Postgres ingest was burning daily disk IO budget.
-	// Re-enable via R2 distribution path. Resolver accepts nil and skips NRD check.
-	var nrdBlocklist *dns.NRDBlocklist
-	resolver := dns.NewResolver(blocklist, nrdBlocklist, policyRuntime, presenceEngine, logger)
+	resolver := dns.NewResolver(blocklist, policyRuntime, presenceEngine, logger)
 	dnsServer := dns.NewServer(db, logger, resolver, blocklist, cfg.DNSListenAddr)
 
 	// â”€â”€ Tunnel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -133,7 +130,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		cfg.SyncBaseURL,
 		cfg.NodeToken,
 		cfg.AnonKey,
-		cfg.SupabaseServiceRoleKey,
+		cfg.ServiceRoleKey,
 		cfg.CommandPollEvery,
 		cfg.HeartbeatEvery,
 		idSvc,
@@ -143,7 +140,7 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		cfg.NodeType,
 		cfg.PublicEndpoint,
 		cfg.IsLANLocal,
-	).WithTunnel(tunnelMgr).WithDNS(dnsServer) // NRD wiring removed 2026-05-01
+	).WithTunnel(tunnelMgr).WithDNS(dnsServer) // wire tunnel + DNS (for blocklist sync reload)
 
 	resolver.SetBlockSink(controlSyncSvc.NewActivityWriter(ctx))
 
@@ -201,10 +198,6 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 			return nil, fmt.Errorf("start sinkhole: %w", err)
 		}
 
-		if err := sinkhole.StartSinkholeTLS(); err != nil {
-			logger.Printf("[wiring] sinkhole tls: %v", err)
-		}
-
 		if cfg.UPnPEnabled && (cfg.NodeType == "home_node" || cfg.NodeType == "lan_node") {
 			sup.Register(upnp.New(51820, logger))
 		}
@@ -214,14 +207,6 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	}
 
 	sup.Register(controlSyncSvc)
-
-	sup.Register(localclock.New(localclock.Config{
-		SupabaseURL:      cfg.SyncBaseURL,
-		AnonKey:          cfg.AnonKey,
-		TickInterval:     1 * time.Second,
-		LookBack:         2 * time.Minute,
-		PerChildDebounce: 30 * time.Second,
-	}, logger))
 
 	// â”€â”€ Hardening: DDNS endpoint updater â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	// Detects public IP changes every 5 minutes and updates the nodes table
@@ -246,9 +231,47 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 	case "vps_relay":
 		token := firstNonEmpty(cfg.RelayNodeToken, cfg.NodeToken)
 		broker := relay.NewBroker()
+
+		// Cloud notifier: controlsync gets fallback transitions so
+		// Supabase can flip the family_fallback_state row and the
+		// parent app can show "running on backup" in realtime.
+		broker.SetCloudNotifier(controlSyncSvc)
+
 		sup.Register(relay.NewBrokerServiceWithBroker(broker, cfg.RelayListenAddr, token))
-		udpBridge := relay.NewUDPBridge(":51820", cfg.RelayFamilyID, broker)
-		sup.Register(udpBridge)
+
+		// Terminator: only registered when fallback is configured.
+		// Without it the bridge silent-drops when no home node is
+		// healthy (with metrics) — same as the original behaviour.
+		var term *terminator.Service
+		if cfg.RelayFallbackEndpoint != "" {
+			term = terminator.NewService(
+				controlSyncSvc,            // ConfigSource: fetches per-family WG config
+				cfg.RelayFallbackEndpoint, // bind addr, e.g. 127.0.0.1:51821
+				blocklist,                 // shared blocklist for DNS filtering in fallback
+				cfg.NATIface,              // egress iface for SNAT (matches existing convention)
+			)
+			sup.Register(term)
+			broker.SetFallbackEndpoint(cfg.RelayFallbackEndpoint)
+			logger.Printf("[wiring] relay fallback enabled: %s", cfg.RelayFallbackEndpoint)
+		} else {
+			logger.Printf("[wiring] relay fallback DISABLED (set SS_ROUTER_RELAY_FALLBACK_ENDPOINT to enable)")
+		}
+
+		bridge := relay.NewUDPBridge(
+			":51820",
+			cfg.RelayFamilyID,
+			broker,
+			broker.Registry,
+			broker.Fallback,
+		)
+		if term != nil {
+			// Per-family endpoint resolution: the bridge calls
+			// term.EnsureFamily(ctx, fam) on first fallback packet
+			// for a device, gets back the local UDP socket addr
+			// the terminator brought up for that family.
+			bridge.SetFamilyEndpointResolver(term)
+		}
+		sup.Register(bridge)
 
 	case "home_node", "lan_node":
 		// RelayBrokerURL is optional â€” if unset, this node connects directly
