@@ -21,7 +21,6 @@ const (
 	activityFlushInterval = 10 * time.Second
 )
 
-
 // ActivityWriter implements dns.BlockSink.
 // RecordBlock is non-blocking. A background goroutine batches and flushes
 // events to the Supabase activity_log table every activityFlushInterval.
@@ -98,12 +97,35 @@ func (aw *ActivityWriter) run(ctx context.Context) {
 }
 
 // activityLogRow matches the activity_log INSERT columns.
+//
+// Field rationale:
+//   - family_id      : already worked, kept.
+//   - event_type     : "dns_blocked" — unchanged taxonomy.
+//   - title          : human-readable.
+//   - domain_blocked : the blocked domain.
+//   - severity       : "info" — the child app uses protection_class, not
+//                      severity, for shield filtering. Severity stays as
+//                      a parent-side signal.
+//   - threat_category: NEW — pulled from BlockEvent.Category. The server-
+//                      side trigger maps this to protection_class for the
+//                      child shield.
+//   - actor_kind     : NEW — "system" so the activity feed RPC can route
+//                      it to the system tab, not the parent-action tab.
+//   - metadata       : NEW — carries src_ip. The existing trigger
+//                      resolve_activity_log_src_ip BEFORE INSERT looks
+//                      this up against devices.wireguard_ip to populate
+//                      child_id and device_id. Without this, those FKs
+//                      stay NULL and the child app can't find its own
+//                      events. THIS WAS THE PRIMARY BUG.
 type activityLogRow struct {
-	FamilyID      string `json:"family_id"`
-	EventType     string `json:"event_type"`
-	Title         string `json:"title"`
-	DomainBlocked string `json:"domain_blocked"`
-	Severity      string `json:"severity"`
+	FamilyID       string                 `json:"family_id"`
+	EventType      string                 `json:"event_type"`
+	Title          string                 `json:"title"`
+	DomainBlocked  string                 `json:"domain_blocked"`
+	Severity       string                 `json:"severity"`
+	ThreatCategory string                 `json:"threat_category,omitempty"`
+	ActorKind      string                 `json:"actor_kind"`
+	Metadata       map[string]interface{} `json:"metadata,omitempty"`
 }
 
 func (aw *ActivityWriter) flush(ctx context.Context, batch []dns.BlockEvent) {
@@ -112,22 +134,50 @@ func (aw *ActivityWriter) flush(ctx context.Context, batch []dns.BlockEvent) {
 		return
 	}
 
-	// Deduplicate within batch — one row per unique domain per flush window
-	seen := make(map[string]struct{}, len(batch))
+	// Deduplicate within batch — one row per (domain, src_ip) pair per
+	// flush window. We MUST include src_ip in the dedup key now that we
+	// track per-child events: if two kids hit the same domain in the same
+	// window, they're separate events and both should log.
+	type dedupKey struct{ domain, srcIP string }
+	seen := make(map[dedupKey]struct{}, len(batch))
 	rows := make([]activityLogRow, 0, len(batch))
+
 	for _, evt := range batch {
 		domain := strings.ToLower(evt.Domain)
-		if _, ok := seen[domain]; ok {
+		if domain == "" {
 			continue
 		}
-		seen[domain] = struct{}{}
-		rows = append(rows, activityLogRow{
+		k := dedupKey{domain: domain, srcIP: evt.SrcIP}
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+
+		row := activityLogRow{
 			FamilyID:      familyID,
 			EventType:     "dns_blocked",
 			Title:         "Blocked: " + domain,
 			DomainBlocked: domain,
 			Severity:      "info",
-		})
+			ActorKind:     "system",
+		}
+		// Only set threat_category if we actually have one — empty string
+		// would override the server trigger logic. omitempty handles JSON.
+		if evt.Category != "" {
+			row.ThreatCategory = strings.ToLower(evt.Category)
+		}
+		// src_ip is what the BEFORE INSERT trigger uses to resolve child_id
+		// and device_id from devices.wireguard_ip.
+		if evt.SrcIP != "" {
+			row.Metadata = map[string]interface{}{
+				"src_ip": evt.SrcIP,
+			}
+		}
+		rows = append(rows, row)
+	}
+
+	if len(rows) == 0 {
+		return
 	}
 
 	raw, err := json.Marshal(rows)
@@ -140,10 +190,15 @@ func (aw *ActivityWriter) flush(ctx context.Context, batch []dns.BlockEvent) {
 	flushCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
+	// IMPORTANT: "return=minimal" not "resolution=ignore-duplicates".
+	// The latter triggers a PostgREST RLS recheck path that returns 401
+	// even with service_role. "return=minimal" tells PostgREST not to
+	// echo the inserted rows back, which is what we want for a fire-and-
+	// forget writer. Documented in router memory; do not regress.
 	_, status, err := aw.svc.client.postRESTPrefer(
 		flushCtx,
 		"/rest/v1/activity_log",
-		"resolution=ignore-duplicates",
+		"return=minimal",
 		raw,
 	)
 	if err != nil || status >= 400 {

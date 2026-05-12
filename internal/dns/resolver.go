@@ -32,12 +32,12 @@ const qTypeA uint16 = 1
 var sinkholeIP = [4]byte{10, 10, 0, 254}
 
 type Resolver struct {
-	blocklist    *Blocklist
-	policy       PolicyReader
-	presence     PresenceReader
-	logger       Logger
-	sink         BlockSink
-	upstreams    []string
+	blocklist *Blocklist
+	policy    PolicyReader
+	presence  PresenceReader
+	logger    Logger
+	sink      BlockSink
+	upstreams []string
 }
 
 // NewResolver constructs the DNS resolver. NRD (newly-registered
@@ -80,28 +80,49 @@ func (r *Resolver) Resolve(ctx context.Context, query []byte, srcIP string) []by
 		return buildNXDomain(query)
 	}
 
-	// ── Priority 2: blocklist — global malware + NRD + per-child categories ──
+	// ── Priority 2: blocklist — global malware + per-child categories ───────
 	//
 	// 2a. Global malware/phishing blocklist — applies to every device.
+	//
+	// CategoryFor does a second SQLite lookup. Cheap — domain just matched,
+	// so the row is hot in cache. Empty string is fine; the server-side
+	// classify_threat_category() function maps NULL/empty to NULL, leaving
+	// the row as unclassified rather than incorrectly tagged.
 	if r.blocklist.IsBlocked(domain) {
-		r.logger.Printf("[dns] blocked (malware) domain=%s src=%s", domain, srcIP)
-		r.sink.RecordBlock(BlockEvent{Domain: domain, SrcIP: srcIP})
+		cat := r.blocklist.CategoryFor(domain)
+		r.logger.Printf("[dns] blocked (%s) domain=%s src=%s", cat, domain, srcIP)
+		r.sink.RecordBlock(BlockEvent{
+			Domain:   domain,
+			SrcIP:    srcIP,
+			Category: cat,
+		})
 		if isAQuery {
 			return buildSinkholeA(query, sinkholeIP)
 		}
 		return buildNXDomain(query)
 	}
 
-        // 2b. NRD blocklist removed 2026-05-01 — re-introduce here when the
+	// 2b. NRD blocklist removed 2026-05-01 — re-introduce here when the
 	// R2 distribution path lands. Sequence: malware/threat → NRD → category.
+	// When re-added, set Category: "newly_registered" on the BlockEvent so
+	// the server trigger classifies it as protective.
 
 	// 2c. Per-child category blocking — only when the policy bundle carries
 	// a non-empty BlockedCategories list for this device's tunnel IP.
 	if r.policy != nil {
 		if cats := r.policy.BlockedCategoriesForIP(srcIP); len(cats) > 0 {
 			if r.blocklist.IsBlockedForCategories(domain, cats) {
-				r.logger.Printf("[dns] blocked (category) domain=%s src=%s cats=%v", domain, srcIP, cats)
-				r.sink.RecordBlock(BlockEvent{Domain: domain, SrcIP: srcIP})
+				// Look up the actual matched category. The cats slice is what
+				// we filtered on, but a domain may belong to several; we want
+				// the row's own category (e.g. "adult"), not the filter list.
+				cat := r.blocklist.CategoryFor(domain)
+				r.logger.Printf("[dns] blocked (category=%s) domain=%s src=%s cats=%v",
+					cat, domain, srcIP, cats)
+				r.sink.RecordBlock(BlockEvent{
+					Domain:   domain,
+					SrcIP:    srcIP,
+					Category: cat,
+				})
 				if isAQuery {
 					return buildSinkholeA(query, sinkholeIP)
 				}
