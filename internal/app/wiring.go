@@ -18,7 +18,8 @@ import (
 	"github.com/getsafeswitch/safeswitch-router/internal/policy"
 	"github.com/getsafeswitch/safeswitch-router/internal/presence"
 	"github.com/getsafeswitch/safeswitch-router/internal/relay"
-	"github.com/getsafeswitch/safeswitch-router/internal/sinkhole"
+	"github.com/getsafeswitch/safeswitch-router/internal/sniproxy"
+        "github.com/getsafeswitch/safeswitch-router/internal/sinkhole"
 	"github.com/getsafeswitch/safeswitch-router/internal/store"
 	"github.com/getsafeswitch/safeswitch-router/internal/supervisor"
 	"github.com/getsafeswitch/safeswitch-router/internal/telemetry"
@@ -142,7 +143,16 @@ func wire(ctx context.Context, cfg Config) (*supervisor.Supervisor, error) {
 		cfg.IsLANLocal,
 	).WithTunnel(tunnelMgr).WithDNS(dnsServer) // wire tunnel + DNS (for blocklist sync reload)
 
-	resolver.SetBlockSink(controlSyncSvc.NewActivityWriter(ctx))
+	sniProxy := sniproxy.NewServer(
+		":8443",
+		blocklist,
+		policyRuntime,
+		controlSyncSvc.NewActivityWriter(ctx),
+		logger,
+	)
+	if err := sniProxy.Start(ctx); err != nil {
+		return nil, fmt.Errorf("sniproxy start: %w", err)
+	}
 
 	// â”€â”€ API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	apiSvc := api.NewService(
