@@ -2,7 +2,7 @@
 //
 // Drop-in replacement for /root/safeswitch-router/internal/dns/blocklist.go.
 //
-// Preserves the exact same public API as Tee's existing blocklist.go:
+// Preserves the public API as Tee's prior blocklist.go:
 //   - NewBlocklist()
 //   - IsBlocked(domain) bool
 //   - IsBlockedForCategories(domain, cats) bool
@@ -10,12 +10,15 @@
 //   - Size() int
 //   - Categories() []string
 //
-// Adds a bloom filter (~3.6 MB RAM) that fronts both lookup paths. The hot
-// path — domains that are NOT blocked — is answered by the bloom filter in
-// nanoseconds without touching either map. Bloom hits fall through to the
-// existing exact-match map walk (which preserves parent-domain blocking).
+// Adds CategoryFor(domain) for the activity_log path so the matched-row
+// category propagates to Supabase without an extra SQLite roundtrip per
+// block. Backed by a domain->category reverse map populated during Load()
+// atomically alongside the other indexes - same lifecycle, no extra DB IO.
 //
-// Behaviour identical, performance dramatically better at scale.
+// Bloom filter (~3.6 MB RAM) fronts both lookup paths. The hot path -
+// domains that are NOT blocked - is answered by the bloom filter in
+// nanoseconds without touching any map. Bloom hits fall through to the
+// existing exact-match map walk (which preserves parent-domain blocking).
 
 package dns
 
@@ -42,12 +45,61 @@ const (
 	bloomHashFuncs = 10
 )
 
+// categoryPriority orders categories so a domain appearing in multiple
+// lists (e.g. a row in both 'malware' and 'tracking') is reported as the
+// most user-protective category. Protective tiers win over policy tiers
+// win over hygiene tiers. Used by domainCategory during Load() to pick
+// which single category to record in the reverse map.
+//
+// Lower number = higher priority. Unlisted categories get the default
+// (large value via the lookup helper).
+var categoryPriority = map[string]int{
+	// Protective (visible to child on Shield)
+	"malware":          1,
+	"phishing":         2,
+	"scam":             3,
+	"ransomware":       4,
+	"cryptojacking":    5,
+	"fake_banking":     6,
+	"newly_registered": 7,
+
+	// Policy (parent-configured)
+	"gambling":      20,
+	"adult":         21,
+	"social_media":  22,
+	"games":         23,
+	"entertainment": 24,
+	"browsing":      25,
+
+	// Hygiene (background noise, never user-facing)
+	"ads":        50,
+	"tracking":   51,
+	"telemetry":  52,
+	"doh_bypass": 53,
+}
+
+func priorityOf(cat string) int {
+	if p, ok := categoryPriority[cat]; ok {
+		return p
+	}
+	return 1 << 30 // unknown categories sort last
+}
+
 type Blocklist struct {
 	mu      sync.RWMutex
 	domains map[string]struct{}
 	// catDomains maps category -> set of domains in that category.
 	// Populated by Load alongside the main domain set.
 	catDomains map[string]map[string]struct{}
+
+	// domainCategory is the reverse index: domain -> single best category.
+	// Populated by Load() in lockstep with catDomains. When a domain
+	// appears in multiple categories, the highest-priority one wins
+	// (see categoryPriority above).
+	//
+	// Used by CategoryFor() to give the activity_writer the right tag
+	// for the matched block - no SQLite roundtrip on the DNS hot path.
+	domainCategory map[string]string
 
 	// bloom fronts both IsBlocked and IsBlockedForCategories. Holds every
 	// domain in the blocklist regardless of category. Rebuilt on each Load.
@@ -56,9 +108,10 @@ type Blocklist struct {
 
 func NewBlocklist() *Blocklist {
 	return &Blocklist{
-		domains:    make(map[string]struct{}),
-		catDomains: make(map[string]map[string]struct{}),
-		bloom:      newBloom(bloomBits, bloomHashFuncs),
+		domains:        make(map[string]struct{}),
+		catDomains:     make(map[string]map[string]struct{}),
+		domainCategory: make(map[string]string),
+		bloom:          newBloom(bloomBits, bloomHashFuncs),
 	}
 }
 
@@ -138,8 +191,48 @@ func (b *Blocklist) IsBlockedForCategories(domain string, cats []string) bool {
 	}
 }
 
-// Load fetches all domains from the DB and populates both the global domain
-// set and the per-category maps. Bloom filter is rebuilt atomically.
+// CategoryFor returns the matched-row category for a blocked domain, walking
+// parent labels the same way IsBlocked does. Returns "" if not blocked.
+//
+// Categories are not unique per domain - a single domain can appear in
+// several Hagezi feeds. We return the highest-priority category by the
+// table at the top of this file so a domain in both 'malware' and 'tracking'
+// is correctly reported as 'malware' for the child shield.
+//
+// Called from the DNS hot path immediately after IsBlocked /
+// IsBlockedForCategories returns true. O(1) map lookup per label, bloom-
+// gated to match IsBlocked's parent-walk behaviour.
+func (b *Blocklist) CategoryFor(domain string) string {
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	if domain == "" {
+		return ""
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	d := domain
+	for {
+		if b.bloom.maybeContains(d) {
+			if cat, ok := b.domainCategory[d]; ok {
+				return cat
+			}
+		}
+		dot := strings.Index(d, ".")
+		if dot < 0 {
+			return ""
+		}
+		d = d[dot+1:]
+	}
+}
+
+// Load fetches all domains from the DB and populates the global domain set,
+// per-category maps, and the domain->category reverse index. Bloom filter is
+// rebuilt atomically.
+//
+// When a domain appears in multiple rows with different categories (e.g.
+// malware-list AND tracking-list), the highest-priority category wins for
+// the reverse index. Both per-category maps still contain the domain, so
+// category-specific enforcement (IsBlockedForCategories) is unaffected.
 func (b *Blocklist) Load(ctx context.Context, db *sql.DB) error {
 	rows, err := db.QueryContext(ctx, `SELECT domain, category FROM dns_blocklist`)
 	if err != nil {
@@ -149,6 +242,7 @@ func (b *Blocklist) Load(ctx context.Context, db *sql.DB) error {
 
 	freshAll := make(map[string]struct{}, 600_000)
 	freshCat := make(map[string]map[string]struct{})
+	freshDomainCat := make(map[string]string, 600_000)
 	freshBloom := newBloom(bloomBits, bloomHashFuncs)
 
 	for rows.Next() {
@@ -169,6 +263,14 @@ func (b *Blocklist) Load(ctx context.Context, db *sql.DB) error {
 			freshCat[cat] = make(map[string]struct{})
 		}
 		freshCat[cat][d] = struct{}{}
+
+		// Reverse index: keep the higher-priority (lower number) category
+		// when a domain shows up in multiple rows. First-write wins for
+		// equal priority, which is fine - equal priority means equivalent
+		// classification tier.
+		if existing, seen := freshDomainCat[d]; !seen || priorityOf(cat) < priorityOf(existing) {
+			freshDomainCat[d] = cat
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -177,6 +279,7 @@ func (b *Blocklist) Load(ctx context.Context, db *sql.DB) error {
 	b.mu.Lock()
 	b.domains = freshAll
 	b.catDomains = freshCat
+	b.domainCategory = freshDomainCat
 	b.bloom = freshBloom
 	b.mu.Unlock()
 
